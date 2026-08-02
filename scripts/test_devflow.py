@@ -1288,6 +1288,48 @@ class DevflowTestCase(unittest.TestCase):
 
     # --- neutral public template ------------------------------------------------------
 
+    def test_audit_git_reflects_the_recorded_remote_evidence(self):
+        self.apply_init()
+        subprocess.run(
+            ["git", "-C", str(self.repo), "remote", "add", "origin", "https://github.com/example/placeholder.git"],
+            check=True,
+        )
+        before = devflow.audit_project(self.repo, "git")
+        self.assertEqual(before["status"], "PARTIAL")
+        self.assertTrue(any("Remote GitHub" in gap for gap in before["gaps"]))
+        devflow.configure_value(self.repo, "github.remote_settings", "verified")
+        after = devflow.audit_project(self.repo, "git")
+        self.assertEqual(after["status"], "PASS")
+        self.assertEqual(after["gaps"], [])
+        self.assertEqual(after["local"]["github_remote_settings"], "verified")
+
+    def test_github_runbook_is_linked_and_matches_the_reported_gaps(self):
+        root = Path(devflow.__file__).resolve().parent.parent
+        runbook = root / "references" / "github-preparation.md"
+        self.assertTrue(runbook.is_file())
+        text = runbook.read_text(encoding="utf-8")
+        # The runbook must speak in the exact words the CLI reports.
+        for reported in [
+            "Remote GitHub rulesets, required checks, and merge policy are unverified",
+            "GitHub remote settings and adapter access are unverified for review/release",
+            "No remotely verified required-check set is configured",
+            "A remote merge ruleset has not been verified",
+            "Background executor availability is unverified",
+            "No GitHub Actions workflow detected",
+        ]:
+            self.assertIn(reported, text, reported)
+        for field in ["github.remote_settings", "github.required_checks", "github.ruleset_verified"]:
+            self.assertIn(field, text, field)
+        for owner_trace in ["belkov", "gmail", "masha"]:
+            self.assertNotIn(owner_trace, text.lower(), owner_trace)
+        for referrer in [root / "README.md", root / "references" / "setup-and-commands.md"]:
+            self.assertIn("github-preparation.md", referrer.read_text(encoding="utf-8"), referrer.name)
+        self.apply_init()
+        self.assertIn(
+            "github-preparation.md",
+            next(item for item in devflow.evaluate_setup(self.repo) if item["stage"] == "git-github")["recommendation"],
+        )
+
     def test_prepare_issue_node_requires_a_single_feature_scope(self):
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")

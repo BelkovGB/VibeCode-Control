@@ -2800,7 +2800,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         "git-github", git_status,
         [f"branch={git_info['branch']}", f"dirty={git_info['dirty']}", f"remotes={len(git_info['remotes'])}"],
         git_gaps,
-        "Audit local Git and remote GitHub separately. Do not claim remote protection without API evidence.",
+        "Audit local Git and remote GitHub separately. Do not claim remote protection without API evidence. Follow references/github-preparation.md step by step.",
         next_for["git-github"], "devflow audit git", False
     ))
 
@@ -3432,7 +3432,25 @@ def managed_block_report(repo: Path) -> dict[str, Any]:
 def audit_project(repo: Path, area: str, deep: bool = False) -> dict[str, Any]:
     inspection = inspect_repository(repo, deep=deep)
     if area == "git":
-        return {"area": area, "status": "PARTIAL" if inspection["git"]["github_remote_settings"] == "unverified" else "PASS", "local": inspection["git"], "remote": inspection["remote"]}
+        # The inspection can only observe the local worktree, so the remote state comes
+        # from what was recorded after an actual API check.  Reading it from the
+        # inspection alone left this audit permanently PARTIAL.
+        recorded = "unverified"
+        if (repo / CONFIG_PATH).is_file():
+            github = load_json(repo / CONFIG_PATH).get("github", {})
+            if isinstance(github, dict) and isinstance(github.get("remote_settings"), str):
+                recorded = github["remote_settings"]
+        local = dict(inspection["git"])
+        local["github_remote_settings"] = recorded
+        gaps = []
+        if not local.get("is_repository"):
+            gaps.append("Local Git repository is not initialized")
+        if not local.get("remotes"):
+            gaps.append("Git remote is not configured or not observable")
+        if recorded != "verified":
+            gaps.append("Remote GitHub rulesets, required checks, and merge policy are unverified")
+        status = "BLOCKED" if not local.get("is_repository") else ("PARTIAL" if gaps else "PASS")
+        return {"area": area, "status": status, "local": local, "remote": inspection["remote"], "gaps": gaps}
     if area == "code":
         return {"area": area, "status": "PASS", "project": inspection["project"], "note": "Semantic code quality requires an agent review and project commands; this deterministic audit reports structure only."}
     if area == "quality":
