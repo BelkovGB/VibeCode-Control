@@ -93,7 +93,8 @@ The run record compares the configured execution parameters (`agent`, `model`, `
 - `explicit` — the actual value must match the configured value exactly; a silent fallback is a failure;
 - `inherited` — the value the client actually used must be observed and recorded;
 - `unset` — record the actually used value in the run record, but never write it back into the configuration;
-- `not-applicable` — the role executes no model; recording any model or effort for it is fabricated evidence and is rejected.
+- `not-applicable` — the role executes no model; recording any model or effort for it is fabricated evidence and is rejected;
+- `undecided` — nobody has chosen the parameter yet; the node cannot preflight and cannot record a `PASS` until the owner decides.
 
 The record stores `checks` plus `configured.modes` and `configured.sources` per parameter, so a later reader sees which value was pinned, which was observed at run time, and where each came from.
 

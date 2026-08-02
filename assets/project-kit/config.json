@@ -9,7 +9,7 @@
     "repository_type": "auto"
   },
   "policy": {
-    "language": "ru",
+    "language": "undecided",
     "rule_precedence": [
       "latest_explicit_pm_decision",
       "current_repository_sources_of_truth",
@@ -28,50 +28,82 @@
   "roles": {
     "human-pm": {
       "agent": "human",
-      "model": {"mode": "not-applicable"},
-      "effort": {"mode": "not-applicable"},
+      "model": {
+        "mode": "not-applicable"
+      },
+      "effort": {
+        "mode": "not-applicable"
+      },
       "permissions": "human-approval"
     },
     "product-lead": {
-      "agent": "codex",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "high"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "plan-and-github"
     },
     "researcher": {
-      "agent": "codex",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "high"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "read-and-research"
     },
     "architect": {
-      "agent": "codex",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "high"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "plan-and-repo-read"
     },
     "implementer": {
-      "agent": "claude-code",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "high"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "workspace-write-no-merge"
     },
     "reviewer": {
-      "agent": "codex",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "xhigh"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "review-and-github"
     },
     "qa": {
-      "agent": "codex",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "high"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "verify-read-only"
     },
     "release-operator": {
-      "agent": "codex",
-      "model": {"mode": "inherited"},
-      "effort": {"mode": "explicit", "value": "high"},
+      "agent": "unresolved",
+      "model": {
+        "mode": "undecided"
+      },
+      "effort": {
+        "mode": "undecided"
+      },
       "permissions": "merge-verified-sha"
     }
   },

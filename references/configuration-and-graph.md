@@ -84,6 +84,8 @@ The role executes no model, because its agent is `human`, `script`, or `determin
 
 Only `explicit` carries a `value` key. A `value` next to any other mode is an error, so nothing absent can later be mistaken for something configured.
 
+The neutral template ships every machine role as `agent: "unresolved"` with `model` and `effort` in `{"mode": "undecided"}`, and `policy.language` as `"undecided"`. `undecided` is not the same as `unset`: `unset` is the owner's decision that a parameter is absent and does not hold anything, while `undecided` means nobody has chosen and blocks the `roles` setup stage, node preflight and any delivery `PASS`. An `unresolved` agent forbids a decided `model` or `effort`: choosing a model before an executor would decide on the owner's behalf.
+
 A role whose agent does not execute a model must use `not-applicable` for both `model` and `effort`; an executing agent must not use it for either. A missing `model` or `effort` key is an error, not an implicit default: write `{"mode": "unset"}` explicitly.
 
 A bare string is the legacy spelling. It is accepted on read and normalized on write:
@@ -93,7 +95,8 @@ A bare string is the legacy spelling. It is accepted on read and normalized on w
 | A concrete value, for example `"high"` | `{"mode": "explicit", "value": "high"}` |
 | `"inherit"` | `{"mode": "inherited"}` |
 | `"not-applicable"` | `{"mode": "not-applicable"}` |
-| `"unset"` or `"unconfigured"` | `{"mode": "unset"}` |
+| `"unset"` | `{"mode": "unset"}` |
+| `"unconfigured"` or `"undecided"` | `{"mode": "undecided"}` |
 
 While legacy spellings remain, validation emits a warning naming the exact pointers, for example `roles.reviewer.model`. `devflow model set` takes the scalar on the command line and stores the typed form.
 
