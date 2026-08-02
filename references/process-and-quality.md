@@ -86,7 +86,7 @@ Map every acceptance criterion to a check, observed result, and durable artifact
 
 Record the outcome with `devflow run record`. A delivery `PASS` requires named evidence: every entry of the node's `expected_evidence` written as `<name>=<reference>`, and every artifact the node's `evidence_contract` marks as required written as `<name>=<kind>:<reference>`, so the kind is proven instead of assumed.
 
-Report checks with `devflow run record --check NAME=CONCLUSION`. Allowed conclusions: `success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, `action_required`, `stale`. Only `success` proves a check. Any other reported conclusion blocks the `PASS`, and every name in `config.github.required_checks` must be reported as `success` before a delivery `PASS`.
+Report checks with `devflow run record --check NAME=CONCLUSION`. Allowed conclusions: `success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, `action_required`, `stale`. Only `success` proves a check. Any other reported conclusion blocks the `PASS`, and every name in `config.github.required_checks` must be reported as `success` before a delivery `PASS`. The gate applies on the `verification`, `review` and `release` stages. On an `implementation` stage conclusions are recorded as evidence and not judged: a `tdd_red` node must prove a test that legitimately fails, so `--check tests=failure` there is recorded and does not block the `PASS`.
 
 The run record compares the configured execution parameters (`agent`, `model`, `effort`) with the observed ones by mode:
 

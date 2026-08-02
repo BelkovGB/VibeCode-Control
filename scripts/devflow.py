@@ -76,6 +76,9 @@ CHECK_CONCLUSIONS = {
     "timed_out", "action_required", "stale",
 }
 PROVEN_CHECK_CONCLUSIONS = {"success"}
+# Stages where every reported check must be green.  Implementation nodes record their
+# conclusions as evidence instead: a RED node proves a test that legitimately fails.
+CHECK_GATED_STAGES = {"verification", "review", "release"}
 # Artifact kinds a review node can be required to produce.
 REVIEW_ARTIFACT_KINDS = {"review", "comment", "findings", "report", "check-run"}
 GATE_ORIGINS = {"skill", "repository-policy", "risk-escalation"}
@@ -3780,19 +3783,23 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                 raise DevflowError(
                     f"Артефакт {name} должен быть записан как {kind}:<ссылка>, чтобы его вид был доказан"
                 )
-        for name, conclusion in sorted(check_results.items()):
-            if conclusion not in PROVEN_CHECK_CONCLUSIONS:
-                raise DevflowError(
-                    f"PASS запрещён: проверка {name} завершилась как {conclusion}; "
-                    "зелёный skipped или neutral не считается выполненной проверкой"
-                )
-        required_checks = config.get("github", {}).get("required_checks", []) if isinstance(config.get("github"), dict) else []
-        if isinstance(required_checks, list) and required_checks:
-            unproven = sorted(str(name) for name in required_checks if check_results.get(str(name)) not in PROVEN_CHECK_CONCLUSIONS)
-            if unproven:
-                raise DevflowError(
-                    "PASS требует conclusion=success для каждой обязательной проверки: " + ", ".join(unproven)
-                )
+        # Checks are gated only where green is the expected outcome.  On an implementation
+        # stage a failing check can be the point of the node: `tdd_red` must prove a test
+        # that fails, so its conclusions are recorded as evidence and not judged here.
+        if stage in CHECK_GATED_STAGES:
+            for name, conclusion in sorted(check_results.items()):
+                if conclusion not in PROVEN_CHECK_CONCLUSIONS:
+                    raise DevflowError(
+                        f"PASS запрещён: проверка {name} завершилась как {conclusion}; "
+                        "зелёный skipped или neutral не считается выполненной проверкой"
+                    )
+            required_checks = config.get("github", {}).get("required_checks", []) if isinstance(config.get("github"), dict) else []
+            if isinstance(required_checks, list) and required_checks:
+                unproven = sorted(str(name) for name in required_checks if check_results.get(str(name)) not in PROVEN_CHECK_CONCLUSIONS)
+                if unproven:
+                    raise DevflowError(
+                        "PASS требует conclusion=success для каждой обязательной проверки: " + ", ".join(unproven)
+                    )
         if node == "post_merge" or nodes[node].get("state") == "POST_MERGE_VERIFY":
             # A closed PR has no refs/pull/<N>/merge; a control dispatch against it
             # fabricates a result instead of proving one.  This is a post-merge rule only:

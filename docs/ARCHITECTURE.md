@@ -230,7 +230,7 @@ Managed-блок `CLAUDE.md` больше не статический шабло
 
 `devflow run record --check NAME=CONCLUSION` фиксирует conclusion проверки. Допустимы `success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, `action_required`, `stale`; доказывает проверку только `success`.
 
-Для PASS на этапе delivery нужны: каждый контрактный артефакт, записанный как `<name>=<kind>:<reference>`, и conclusion `success` у каждой проверки из `config.github.required_checks`. Любой другой зафиксированный conclusion, включая внешне безобидный `skipped`, блокирует PASS. Успешный job без объявленного артефакта не считается пройденной проверкой.
+Для PASS на этапе delivery нужны: каждый контрактный артефакт, записанный как `<name>=<kind>:<reference>`, и conclusion `success` у каждой проверки из `config.github.required_checks`. Любой другой зафиксированный conclusion, включая внешне безобидный `skipped`, блокирует PASS. Успешный job без объявленного артефакта не считается пройденной проверкой. Гейт применяется на стадиях `verification`, `review` и `release`. На стадиях `implementation` conclusions записываются как доказательство и не гейтятся: узел `tdd_red` обязан доказать легитимно падающий тест, поэтому `--check tests=failure` там фиксируется и не блокирует PASS.
 
 После merge нельзя диспатчить workflow против закрытого PR, если ему нужен `refs/pull/<N>/merge`: на post-merge-узле (id `post_merge` или состояние `POST_MERGE_VERIFY`) CLI отклоняет доказательство с такой ссылкой, потому что у закрытого PR такого ref нет и dispatch против него фабрикует результат. До merge этот ref — канонический ориентир merge-гейта и остаётся пригодным к использованию.
 

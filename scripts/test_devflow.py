@@ -1074,6 +1074,30 @@ class DevflowTestCase(unittest.TestCase):
         self.assertEqual(stored["configured"]["modes"]["model"], "explicit")
         self.assertEqual(stored["configured"]["sources"]["effort"], "roles.reviewer.effort")
 
+    def test_red_node_passes_with_required_checks_configured_and_no_check_claims(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(required_checks=("tests",))
+        head = self.commit_worktree()
+        recorded = devflow.record_run(
+            self.repo, "tdd_red", "PASS", head, "ISSUE-1", "PR-1",
+            ["failing test before implementation=ci://run/1", "failure reason=assert 1 == 2"],
+            "claude-code", "verified-model", "high", [],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+
+    def test_red_node_records_a_failing_check_as_evidence_without_blocking(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(required_checks=("tests",))
+        head = self.commit_worktree()
+        recorded = devflow.record_run(
+            self.repo, "tdd_red", "PASS", head, "ISSUE-1", "PR-1",
+            ["failing test before implementation=ci://run/1", "failure reason=assert 1 == 2"],
+            "claude-code", "verified-model", "high", ["tests=failure"],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["checks"], {"tests": "failure"})
+
     def test_green_skipped_conclusion_is_not_a_passed_check(self):
         self.apply_init()
         self.prepare_verified_delivery_state()
