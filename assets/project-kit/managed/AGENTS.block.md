@@ -19,5 +19,22 @@ For delivery work:
 - Record `BLOCKED` with evidence for technical blockers. Use `HUMAN_NEEDED` only for a product decision, material compromise, unavailable access, irreversible risk, or real human approval.
 - After two correction cycles without material progress, stop and present a concise stop-check to the PM.
 
+For execution configuration:
+
+- Read the effective configuration instead of guessing: `python3 .agent-flow/devflow.py --repo . config effective`.
+- Every model and effort parameter carries a mode. `explicit` pins a value; `inherited` is resolved by the client at run time and must be observed and recorded; `unset` means the parameter is deliberately absent and must never be materialized; `not-applicable` belongs to a role that executes no model.
+- Before moving a stage between clients, show the effective-configuration matrix, and after writing rebuild it from the actual files and compare it cell by cell. A mismatch is `BLOCKED`, never a fallback.
+- Client execution configuration is not portable: agent identifiers, models, effort vocabularies, and permission profiles differ per client and require an explicit decision, not a copied default.
+
+For review and checks:
+
+- A successful job is not a passed check. A review node must publish the artifact its `evidence_contract` declares — review, comment, or findings — and the run record must name it as `<name>=<kind>:<reference>`.
+- Verify the `conclusion` and the annotations and logs, not only that a job finished. A green `skipped`, `neutral`, or `cancelled` conclusion does not prove a check.
+- If a PR changes the workflow that verifies it, determine whether the base or the head version actually executed before trusting the result. If the action requires the workflow to match the default branch, record a one-time exception and perform a full manual review.
+- Do not repeat a run without changing the cause of the failure, and do not treat a re-run as a fix.
+- After merge, do not dispatch a workflow against the closed PR when it needs `refs/pull/<N>/merge`; use an open test PR or the next working PR.
+
+When posting multi-line Markdown through the GitHub CLI, pass it with `--body-file` or stdin instead of a multi-line `--body`, so line breaks survive the shell.
+
 Before a background node runs, execute the VibeCode Control skill preflight and explicitly load every skill assigned to that node. Never fetch or update skills from the network during an ordinary background run.
 <!-- devflow:managed:end -->

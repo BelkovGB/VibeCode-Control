@@ -7,8 +7,9 @@
 3. Ready Issues and backlog
 4. Implementation and evidence
 5. Review, merge, and documentation
-6. Stall control
-7. Limits
+6. Self-modifying workflows
+7. Stall control
+8. Limits
 
 ## Authority
 
@@ -83,9 +84,24 @@ Keep fixtures, seed data, and environments reproducible. Do not use retries to c
 
 Map every acceptance criterion to a check, observed result, and durable artifact. Bind evidence to the current head SHA. A new commit invalidates prior approval and any result that no longer corresponds to the code.
 
+Record the outcome with `devflow run record`. A delivery `PASS` requires named evidence: every entry of the node's `expected_evidence` written as `<name>=<reference>`, and every artifact the node's `evidence_contract` marks as required written as `<name>=<kind>:<reference>`, so the kind is proven instead of assumed.
+
+Report checks with `devflow run record --check NAME=CONCLUSION`. Allowed conclusions: `success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, `action_required`, `stale`. Only `success` proves a check. Any other reported conclusion blocks the `PASS`, and every name in `config.github.required_checks` must be reported as `success` before a delivery `PASS`. The gate applies on the `verification`, `review` and `release` stages. On an `implementation` stage conclusions are recorded as evidence and not judged: a `tdd_red` node must prove a test that legitimately fails, so `--check tests=failure` there is recorded and does not block the `PASS`.
+
+The run record compares the configured execution parameters (`agent`, `model`, `effort`) with the observed ones by mode:
+
+- `explicit` — the actual value must match the configured value exactly; a silent fallback is a failure;
+- `inherited` — the value the client actually used must be observed and recorded;
+- `unset` — record the actually used value in the run record, but never write it back into the configuration;
+- `not-applicable` — the role executes no model; recording any model or effort for it is fabricated evidence and is rejected.
+
+The record stores `checks` plus `configured.modes` and `configured.sources` per parameter, so a later reader sees which value was pinned, which was observed at run time, and where each came from.
+
 ## Review, merge, and documentation
 
-Use implementer review and independent final review as additional safeguards. Verify against the ready Issue, product scope, architecture, project policy, actual diff, and fresh objective evidence.
+Use implementer review and independent final review as additional safeguards. Verify against the ready Issue, product scope, architecture, project policy, actual diff, and fresh objective evidence. Never combine implementation and independent final review in one session.
+
+A successful job is not a passed check. A review node declares its artifact in `evidence_contract`, mapping an expected evidence name to a kind — `review`, `comment`, `findings`, `report`, or `check-run`. The shipped graph declares `self-review report` as `findings` for `implementer_review` and `review verdict bound to head SHA` as `review` for `final_review`. Without that artifact recorded as `<name>=<kind>:<reference>` the node cannot be `PASS`. A graph written before this contract keeps review nodes that declare nothing: validation warns and names the node instead of failing, so the graph stays valid, and `devflow run record` refuses the `PASS` on such a node until `devflow graph --migrate --apply` adds the missing contracts. Read the conclusion together with annotations and logs; a job that merely finished proves nothing.
 
 Require the implementer to fix the full verified class of a defect and add regression protection. Close blocking threads. Keep the branch current according to repository policy.
 
@@ -93,7 +109,7 @@ Merge only when:
 
 - agreed scope is complete;
 - every acceptance criterion is verified;
-- required checks are green for the current head;
+- every check in `config.github.required_checks` is reported with conclusion `success` for the current head;
 - blocking findings and threads are resolved;
 - documentation matches actual post-merge behavior;
 - PR description matches current head;
@@ -102,7 +118,19 @@ Merge only when:
 
 When architecture changes, update `docs/ARCHITECTURE.md` in the same PR. Update related diagrams, `README`, ADRs, and runbooks as needed. Document the resulting reality, not a plan or discussion history. Block merge if architecture docs are stale.
 
-Run only post-merge, deploy, smoke, or operational checks required by repository policy, task criteria, or change risk.
+Run only post-merge, deploy, smoke, or operational checks required by repository policy, task criteria, or change risk. After the merge, do not dispatch a workflow against the closed PR when it needs `refs/pull/<N>/merge`: the ref no longer exists, so the dispatch fabricates a result instead of proving one. Use an open test PR or the next working PR. `devflow run record` rejects evidence referencing `refs/pull/<N>/merge` on the post-merge node only — id `post_merge` or state `POST_MERGE_VERIFY`. Before the merge that ref is the canonical merge-gate reference and stays usable.
+
+Pass multi-line Markdown to the GitHub CLI with `--body-file` or stdin instead of a multi-line `--body`, so line breaks survive the shell.
+
+## Self-modifying workflows
+
+A PR that changes the control plane verifying it may be checked by a version other than the one under review. Guarded paths are `.agent-flow/`, `AGENTS.md`, `CLAUDE.md`, `.github/workflows/`, `.github/devflow/prompts/`, and both `devflow-node` skill copies.
+
+- `devflow operate --node <id>` reports `self_modification`: the base ref, the merge base, and the guarded paths this branch changes. If the base cannot be determined locally it says so; do not guess it.
+- Determine whether the base or the head version actually executed before trusting a result.
+- Inspect annotations and logs, not only the conclusion.
+- Do not repeat a run without changing the cause of the failure; a re-run is not a fix.
+- When an action requires workflow identity with the default branch, record a one-time exception with its reason and perform a full manual review of the change.
 
 ## Stall control
 

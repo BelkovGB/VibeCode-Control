@@ -43,6 +43,19 @@
           "competencies": {"type": "array", "items": {"type": "string"}},
           "inputs": {"type": "array", "items": {"type": "string"}},
           "expected_evidence": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+          "evidence_contract": {
+            "type": "object",
+            "description": "Typed artifact requirement per expected_evidence name. A successful job without the required artifact is not a passed check.",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["kind"],
+              "properties": {
+                "kind": {"enum": ["review", "comment", "findings", "report", "check-run"]},
+                "required": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          },
           "checks": {"type": "array", "items": {"type": "string"}},
           "timeout_minutes": {"type": "integer", "minimum": 0}
         },

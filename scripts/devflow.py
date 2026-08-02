@@ -45,6 +45,43 @@ GITIGNORE_END = "# devflow:managed:end"
 STATUS_VALUES = {"PASS", "PARTIAL", "BLOCKED", "NOT_APPLICABLE"}
 DECISION_VALUES = {"unresolved", "zero-skill", "assigned", "blocked"}
 RECOMMENDATION_VALUES = {"REQUIRED", "RECOMMENDED", "OPTIONAL", "NOT_NEEDED", "REJECT", "EVALUATE"}
+
+# Typed execution-configuration contract.  A model or effort parameter carries a
+# mode, never a bare string that hides whether the value was chosen, inherited,
+# or deliberately left out.  `unset` must never be materialized into a concrete
+# value by a resolver, a renderer, or a run record.
+MODE_EXPLICIT = "explicit"
+MODE_INHERITED = "inherited"
+MODE_UNSET = "unset"
+MODE_NOT_APPLICABLE = "not-applicable"
+CONFIG_MODES = {MODE_EXPLICIT, MODE_INHERITED, MODE_UNSET, MODE_NOT_APPLICABLE}
+TYPED_PROFILE_FIELDS = ("model", "effort")
+PROFILE_FIELDS = ("agent", "model", "effort", "permissions")
+# Agents that never execute a model, so an executable model/effort is a lie for them.
+NON_EXECUTING_AGENTS = {"human", "script", "deterministic"}
+# Legacy scalar spellings accepted on read so existing projects normalize without
+# losing semantics.  They are never written back.
+LEGACY_MODE_TOKENS = {
+    "inherit": MODE_INHERITED,
+    "inherited": MODE_INHERITED,
+    "not-applicable": MODE_NOT_APPLICABLE,
+    "not_applicable": MODE_NOT_APPLICABLE,
+    "n/a": MODE_NOT_APPLICABLE,
+    "unset": MODE_UNSET,
+    "unconfigured": MODE_UNSET,
+}
+# Check conclusions that a remote adapter can report.  Only `success` proves a check.
+CHECK_CONCLUSIONS = {
+    "success", "failure", "cancelled", "skipped", "neutral",
+    "timed_out", "action_required", "stale",
+}
+PROVEN_CHECK_CONCLUSIONS = {"success"}
+# Stages where every reported check must be green.  Implementation nodes record their
+# conclusions as evidence instead: a RED node proves a test that legitimately fails.
+CHECK_GATED_STAGES = {"verification", "review", "release"}
+# Artifact kinds a review node can be required to produce.
+REVIEW_ARTIFACT_KINDS = {"review", "comment", "findings", "report", "check-run"}
+GATE_ORIGINS = {"skill", "repository-policy", "risk-escalation"}
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", "node_modules", "vendor",
     ".venv", "venv", "dist", "build", "coverage", ".next", ".turbo",
@@ -296,6 +333,19 @@ def hash_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
+def hash_file_map(files: dict[str, Path]) -> str:
+    """Checksum an explicit relative-path -> file map, framed exactly like `hash_tree`."""
+    digest = hashlib.sha256()
+    for relative in sorted(files):
+        raw = relative.encode("utf-8")
+        digest.update(len(raw).to_bytes(4, "big"))
+        digest.update(raw)
+        data = files[relative].read_bytes()
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
 def find_project_kit(repo: Path) -> Path:
     override = os.environ.get("DEVFLOW_SKILL_ROOT")
     candidates = []
@@ -368,6 +418,8 @@ def plan_path_allowed(mode: str, relative: str) -> bool:
         return relative in setup_exact or relative.startswith(f"{META_DIR}/toolkit/") or relative.startswith(".github/devflow/prompts/")
     if mode in {"config-set", "role-set", "model-set", "permissions-set"}:
         return relative in {CONFIG_PATH, SKILLS_LOCK_PATH}
+    if mode == "graph-migrate":
+        return relative == WORKFLOW_PATH
     if mode == "setup-mark":
         return relative == SETUP_STATE_PATH
     if mode in {"skills-decision", "skills-unassign"}:
@@ -544,6 +596,133 @@ def initialize_skill_decisions(lock: dict[str, Any], workflow: dict[str, Any]) -
         }
 
 
+def extract_managed_block(text: str, start: str = MANAGED_START, end: str = MANAGED_END) -> str | None:
+    """Return the managed block exactly as `replace_managed_block` would have written it."""
+    if text.count(start) != 1 or text.count(end) != 1:
+        return None
+    _, tail = text.split(start, 1)
+    body, _ = tail.split(end, 1)
+    return (start + body + end).strip() + "\n"
+
+
+def client_role_assignments(config: Any, workflow: Any, client: str) -> list[dict[str, Any]]:
+    """List the roles this client actually owns, with the nodes it would execute."""
+    roles = config.get("roles") if isinstance(config, dict) else {}
+    roles = roles if isinstance(roles, dict) else {}
+    nodes = workflow.get("nodes") if isinstance(workflow, dict) else []
+    nodes = nodes if isinstance(nodes, list) else []
+    # Ownership is decided per node on the resolved agent, so a node routed to this client
+    # by a node override is neither missed nor wrongly claimed.
+    owned: dict[tuple[str, str, str], list[str]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        resolution = resolve_execution_profile(node, config if isinstance(config, dict) else {})
+        agent = resolution["agent"].get("value")
+        if not agent or expected_target_for_agent(agent) != client:
+            continue
+        role = str(node.get("role"))
+        permissions = resolution["permissions"].get("value") or "unset"
+        owned.setdefault((role, agent, permissions), []).append(str(node.get("id")))
+    assignments = [
+        {"role": role, "agent": agent, "permissions": permissions, "nodes": sorted(node_ids)}
+        for (role, agent, permissions), node_ids in owned.items()
+    ]
+    covered = {item["role"] for item in assignments}
+    for role in sorted(roles):
+        settings = roles[role]
+        if not isinstance(settings, dict) or role in covered:
+            continue
+        agent = settings.get("agent")
+        if not isinstance(agent, str) or expected_target_for_agent(agent) != client:
+            continue
+        assignments.append({
+            "role": role,
+            "agent": agent,
+            "permissions": settings.get("permissions") if isinstance(settings.get("permissions"), str) else "unset",
+            "nodes": [],
+        })
+    assignments.sort(key=lambda item: (item["role"], item["permissions"], item["agent"]))
+    return assignments
+
+
+def render_client_role_block(config: Any, workflow: Any, client: str, title: str) -> str:
+    """Build the managed instruction block from the roles actually configured.
+
+    The block never claims an authority the configuration does not grant and never
+    withholds one it does; `doctor` verifies this generated variant, not a fixed text.
+    """
+    assignments = client_role_assignments(config, workflow, client)
+    owned = {item["role"] for item in assignments}
+    lines = [MANAGED_START, f"## {title}", ""]
+    if not assignments:
+        lines += [
+            f"No workflow role in this project is assigned to {title.split(' ')[0]}. Do not act as a background "
+            f"executor here. If this is wrong, the owner assigns the role in `{CONFIG_PATH}` and reruns "
+            "`devflow upgrade`; do not assume a role that the configuration does not grant.",
+            "",
+            MANAGED_END,
+        ]
+        return "\n".join(lines) + "\n"
+    lines.append("Configured roles and permission profiles, resolved from `" + CONFIG_PATH + "`:")
+    lines.append("")
+    for item in assignments:
+        nodes = ", ".join(item["nodes"]) if item["nodes"] else "no workflow node"
+        lines.append(f"- `{item['role']}` (`{item['permissions']}`) — nodes: {nodes}")
+    lines += [
+        "",
+        "Act only inside the permissions of the workflow node you were given, and only in a role listed "
+        "above. Do not change product scope, roadmap, priorities, or architecture trade-offs outside the "
+        "approved scope.",
+        "",
+        "Never combine implementation and independent final review in the same session: a change you "
+        "implemented must be reviewed by a different context.",
+        "",
+        "Before acting:",
+        "",
+        f"1. Read `AGENTS.md`, `{CONFIG_PATH}`, `{WORKFLOW_PATH}`, `{SKILLS_LOCK_PATH}`, and every document named by the Issue.",
+        "2. Identify the current workflow node and run "
+        "`python3 .agent-flow/devflow.py --repo . operate --node <node>` (`py` instead of `python3` on Windows).",
+        "3. Stop as `BLOCKED` if an assigned required skill is missing, changed, or unavailable in this environment.",
+        "4. Use the effective configuration, not a guess: "
+        "`python3 .agent-flow/devflow.py --repo . config effective`. A parameter whose mode is "
+        f"`{MODE_UNSET}` stays absent; a parameter whose mode is `{MODE_INHERITED}` is observed at run time "
+        "and recorded, never invented.",
+    ]
+    if "implementer" in owned:
+        lines += [
+            "",
+            "As `implementer`: establish the baseline, prove the failing test for a behavior change, make the "
+            "smallest complete change, add risk-based tests, preserve guardrails, update architecture "
+            "documentation in the same PR when architecture changes, and fix the full verified class of any "
+            "review finding.",
+        ]
+    if owned & {"reviewer", "qa"}:
+        lines += [
+            "",
+            "As `reviewer` or `qa`: a successful job is not a passed check. Publish the artifact the node "
+            "requires — review, comment, or findings — and record it with "
+            "`devflow run record --evidence '<name>=<kind>:<reference>'`. A green `skipped` conclusion is not "
+            "a completed check.",
+        ]
+    if "release-operator" in owned:
+        lines += [
+            "",
+            "As `release-operator`: merge only the exact verified head SHA after the merge gate passes, and "
+            "never re-dispatch a post-merge check against a closed PR that needs `refs/pull/<N>/merge`.",
+        ]
+    else:
+        lines += ["", "Do not merge the PR: no role assigned here grants merge authority."]
+    lines += [
+        "",
+        "Report commands, results, evidence, and the current head SHA. Never claim a test or CI status that "
+        "was not freshly observed.",
+        "",
+        MANAGED_END,
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def managed_text(repo: Path, relative: str, block: str, start: str = MANAGED_START, end: str = MANAGED_END) -> bytes:
     path = ensure_within(repo, relative)
     existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
@@ -624,8 +803,15 @@ def build_setup_plan(repo: Path, mode: str, purpose: str = "setup") -> dict[str,
     add(f"{META_DIR}/devflow.py", Path(__file__).read_bytes())
 
     managed = kit / "managed"
+    # Role-aware managed instructions are generated from the configuration that is
+    # actually installed, never from the kit default, so `adopt` over a project that
+    # reassigned roles does not overwrite it with the shipped role split.
+    role_config = load_json(repo / CONFIG_PATH) if (repo / CONFIG_PATH).is_file() else config_template
+    role_workflow = load_json(repo / WORKFLOW_PATH) if (repo / WORKFLOW_PATH).is_file() else workflow_template
     add("AGENTS.md", managed_text(repo, "AGENTS.md", (managed / "AGENTS.block.md").read_text(encoding="utf-8")))
-    add("CLAUDE.md", managed_text(repo, "CLAUDE.md", (managed / "CLAUDE.block.md").read_text(encoding="utf-8")))
+    add("CLAUDE.md", managed_text(
+        repo, "CLAUDE.md", render_client_role_block(role_config, role_workflow, "claude", "Claude roles in this project")
+    ))
     add(
         ".github/pull_request_template.md",
         managed_text(repo, ".github/pull_request_template.md", (managed / "pull_request_template.block.md").read_text(encoding="utf-8")),
@@ -643,7 +829,7 @@ def build_setup_plan(repo: Path, mode: str, purpose: str = "setup") -> dict[str,
     """).strip() + "\n"
     add(".gitignore", managed_text(repo, ".gitignore", gitignore_block, GITIGNORE_START, GITIGNORE_END))
 
-    return {
+    return attach_effective_configuration(repo, {
         "schema_version": 1,
         "devflow_version": VERSION,
         "run_id": run_id(purpose),
@@ -656,7 +842,7 @@ def build_setup_plan(repo: Path, mode: str, purpose: str = "setup") -> dict[str,
             "Remote GitHub settings, models, CI results, and background-agent availability remain unverified until their adapters are checked.",
             "Third-party skills are not installed; every workflow node remains awaiting an explicit skill or zero-skill decision."
         ]
-    }
+    })
 
 
 def apply_plan(repo: Path, plan: dict[str, Any]) -> dict[str, Any]:
@@ -695,6 +881,24 @@ def apply_plan(repo: Path, plan: dict[str, Any]) -> dict[str, Any]:
             "repo": str(repo.resolve()),
             "operations": applied,
         }
+        expected_matrix = plan.get("effective_configuration")
+        if isinstance(expected_matrix, dict):
+            manifest["effective_configuration"] = expected_matrix
+            # Rebuild the matrix from the files that were just written and compare it
+            # cell by cell with the approved plan.  A mismatch rolls the write back
+            # instead of being reconciled by a hidden fallback.
+            try:
+                actual_matrix = effective_configuration_from_files(repo)
+            except DevflowError as exc:
+                raise DevflowError(
+                    f"Эффективная конфигурация не читается из файлов после записи: {exc}"
+                ) from exc
+            differences = compare_effective_configuration(expected_matrix, actual_matrix)
+            if differences:
+                raise DevflowError(
+                    "Эффективная конфигурация после записи не совпала с утверждённым планом: "
+                    + "; ".join(differences[:20])
+                )
         identifier = safe_run_identifier(str(plan.get("run_id", "")))
         manifest_path = ensure_within(repo, f"{LOCAL_DIR}/runs/{identifier}.json")
         atomic_write(manifest_path, json_bytes(manifest))
@@ -739,7 +943,24 @@ def verify_run(repo: Path, identifier: str, expected_sha256: str) -> dict[str, A
     identifier = safe_run_identifier(identifier)
     manifest = load_trusted_manifest(repo, identifier, expected_sha256)
     drift = manifest_drift(repo, manifest)
-    return {"status": "PASS" if not drift else "BLOCKED", "run_id": identifier, "drift": drift}
+    # Rebuild the effective configuration from the files that were actually written and
+    # compare it cell by cell with the approved plan.  A mismatch blocks; it is never
+    # reconciled by a fallback.
+    matrix_drift: list[str] = []
+    expected_matrix = manifest.get("effective_configuration")
+    if isinstance(expected_matrix, dict):
+        try:
+            actual_matrix = effective_configuration_from_files(repo)
+        except DevflowError as exc:
+            matrix_drift = [f"Не удалось перечитать эффективную конфигурацию из файлов: {exc}"]
+        else:
+            matrix_drift = compare_effective_configuration(expected_matrix, actual_matrix)
+    return {
+        "status": "PASS" if not drift and not matrix_drift else "BLOCKED",
+        "run_id": identifier,
+        "drift": drift,
+        "effective_configuration_drift": matrix_drift,
+    }
 
 
 def manifest_drift(repo: Path, manifest: dict[str, Any]) -> list[str]:
@@ -980,6 +1201,181 @@ def inspect_repository(repo: Path, deep: bool = False) -> dict[str, Any]:
     return report
 
 
+def parse_profile_value(raw: Any, pointer: str) -> tuple[dict[str, Any], list[str]]:
+    """Parse one model/effort parameter into a typed {mode, value} pair.
+
+    Accepts the legacy scalar spelling so an installed project can be normalized
+    without losing semantics, and rejects any shape that would let an absent
+    parameter masquerade as a concrete one.
+    """
+    errors: list[str] = []
+    if isinstance(raw, dict):
+        mode = raw.get("mode")
+        value = raw.get("value")
+        unknown = sorted(set(raw) - {"mode", "value"})
+        if unknown:
+            errors.append(f"{pointer} содержит неизвестные ключи: {', '.join(unknown)}")
+        if mode not in CONFIG_MODES:
+            errors.append(f"{pointer}.mode должен быть одним из: {', '.join(sorted(CONFIG_MODES))}")
+            return {"mode": MODE_UNSET}, errors
+        if mode == MODE_EXPLICIT:
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"{pointer}.value обязателен и непуст при mode={MODE_EXPLICIT}")
+                return {"mode": MODE_UNSET}, errors
+            return {"mode": MODE_EXPLICIT, "value": value.strip()}, errors
+        if value is not None:
+            errors.append(
+                f"{pointer}.value недопустим при mode={mode}: значение не должно материализоваться"
+            )
+        # A non-explicit parameter carries no value key at all, so nothing can later be
+        # mistaken for a configured one.
+        return {"mode": mode}, errors
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            errors.append(f"{pointer} не задан")
+            return {"mode": MODE_UNSET}, errors
+        legacy = LEGACY_MODE_TOKENS.get(text.lower())
+        if legacy:
+            return {"mode": legacy}, errors
+        return {"mode": MODE_EXPLICIT, "value": text}, errors
+    errors.append(f"{pointer} должен быть строкой или объектом с полем mode")
+    return {"mode": MODE_UNSET}, errors
+
+
+def profile_display(entry: dict[str, Any]) -> str:
+    """Render one typed parameter as the single token shown in tables and graphs."""
+    mode = entry.get("mode", MODE_UNSET)
+    if mode == MODE_EXPLICIT:
+        return str(entry.get("value") or "")
+    if mode == MODE_INHERITED:
+        return "inherit"
+    return str(mode)
+
+
+def normalize_profile_settings(settings: Any, pointer: str) -> tuple[dict[str, Any], list[str]]:
+    if not isinstance(settings, dict):
+        return {}, [f"{pointer} должен быть объектом"]
+    errors: list[str] = []
+    result = copy.deepcopy(settings)
+    for field in TYPED_PROFILE_FIELDS:
+        if field not in settings:
+            continue
+        entry, field_errors = parse_profile_value(settings[field], f"{pointer}.{field}")
+        errors.extend(field_errors)
+        result[field] = entry
+    return result, errors
+
+
+def normalize_config(config: Any) -> tuple[dict[str, Any], list[str]]:
+    """Return the config with every model/effort parameter in canonical typed form."""
+    if not isinstance(config, dict):
+        return {}, ["config должен быть объектом"]
+    errors: list[str] = []
+    result = copy.deepcopy(config)
+    for section in ["roles", "node_overrides"]:
+        block = config.get(section)
+        if not isinstance(block, dict):
+            continue
+        normalized: dict[str, Any] = {}
+        for name, settings in block.items():
+            entry, section_errors = normalize_profile_settings(settings, f"{section}.{name}")
+            errors.extend(section_errors)
+            normalized[name] = entry if entry else settings
+        result[section] = normalized
+    return result, errors
+
+
+def config_uses_legacy_profile(config: Any) -> list[str]:
+    """List the pointers still using the untyped scalar spelling."""
+    legacy: list[str] = []
+    if not isinstance(config, dict):
+        return legacy
+    for section in ["roles", "node_overrides"]:
+        block = config.get(section)
+        if not isinstance(block, dict):
+            continue
+        for name, settings in block.items():
+            if not isinstance(settings, dict):
+                continue
+            for field in TYPED_PROFILE_FIELDS:
+                if field in settings and not isinstance(settings[field], dict):
+                    legacy.append(f"{section}.{name}.{field}")
+    return legacy
+
+
+def resolve_execution_profile(node: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve agent, model, effort and permissions for one node, with provenance.
+
+    Every field reports where its value came from, so a cross-client transfer can
+    be reviewed before it is written and rebuilt from the files afterwards.
+    """
+    node_id = node.get("id")
+    role_name = node.get("role")
+    roles = config.get("roles") if isinstance(config, dict) else {}
+    roles = roles if isinstance(roles, dict) else {}
+    role = roles.get(role_name)
+    role = role if isinstance(role, dict) else {}
+    overrides = config.get("node_overrides") if isinstance(config, dict) else {}
+    overrides = overrides if isinstance(overrides, dict) else {}
+    override = overrides.get(node_id)
+    override = override if isinstance(override, dict) else {}
+
+    def source(level: str, pointer: str | None, file: str | None) -> dict[str, Any]:
+        return {"level": level, "pointer": pointer, "file": file}
+
+    resolution: dict[str, Any] = {}
+    for field in TYPED_PROFILE_FIELDS:
+        if field in override:
+            entry, _ = parse_profile_value(override[field], f"node_overrides.{node_id}.{field}")
+            origin = source("node-override", f"node_overrides.{node_id}.{field}", CONFIG_PATH)
+        elif field in role:
+            entry, _ = parse_profile_value(role[field], f"roles.{role_name}.{field}")
+            origin = source("role", f"roles.{role_name}.{field}", CONFIG_PATH)
+        else:
+            entry = {"mode": MODE_UNSET}
+            origin = source("absent", None, None)
+        item = dict(entry)
+        item["source"] = origin
+        if item["mode"] == MODE_INHERITED:
+            # A role inherits from the client runtime; a node override inherits from its role.
+            item["inherited_from"] = "client" if origin["level"] == "role" else "role"
+        resolution[field] = item
+
+    if "agent" in override:
+        raw_agent, agent_origin = override["agent"], source("node-override", f"node_overrides.{node_id}.agent", CONFIG_PATH)
+    elif "agent" in role:
+        raw_agent, agent_origin = role["agent"], source("role", f"roles.{role_name}.agent", CONFIG_PATH)
+    else:
+        raw_agent, agent_origin = None, source("absent", None, None)
+    agent_value = raw_agent.strip() if isinstance(raw_agent, str) and raw_agent.strip() else None
+    resolution["agent"] = {
+        "mode": MODE_EXPLICIT if agent_value else MODE_UNSET,
+        "value": agent_value,
+        "source": agent_origin,
+    }
+
+    if "permissions" in override:
+        raw_permissions = override["permissions"]
+        permissions_origin = source("node-override", f"node_overrides.{node_id}.permissions", CONFIG_PATH)
+    elif isinstance(node.get("permissions"), str) and node["permissions"].strip():
+        raw_permissions = node["permissions"]
+        permissions_origin = source("node", f"nodes.{node_id}.permissions", WORKFLOW_PATH)
+    elif "permissions" in role:
+        raw_permissions = role["permissions"]
+        permissions_origin = source("role", f"roles.{role_name}.permissions", CONFIG_PATH)
+    else:
+        raw_permissions, permissions_origin = None, source("absent", None, None)
+    permissions_value = raw_permissions.strip() if isinstance(raw_permissions, str) and raw_permissions.strip() else None
+    resolution["permissions"] = {
+        "mode": MODE_EXPLICIT if permissions_value else MODE_UNSET,
+        "value": permissions_value,
+        "source": permissions_origin,
+    }
+    resolution["executes_model"] = agent_value not in NON_EXECUTING_AGENTS if agent_value else True
+    return resolution
+
+
 def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -1000,13 +1396,46 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
     if not isinstance(roles, dict) or not roles:
         errors.append("config.roles отсутствует или пуст")
         roles = {}
+    typed_roles: dict[str, dict[str, Any]] = {}
     for role, settings in roles.items():
         if not isinstance(settings, dict):
             errors.append(f"roles.{role} должен быть объектом")
             continue
-        for field in ["agent", "model", "effort", "permissions"]:
-            if not isinstance(settings.get(field), str) or not settings[field]:
+        for field in ["agent", "permissions"]:
+            if not isinstance(settings.get(field), str) or not settings[field].strip():
                 errors.append(f"roles.{role}.{field} не задан")
+        parsed: dict[str, Any] = {}
+        for field in TYPED_PROFILE_FIELDS:
+            if field not in settings:
+                errors.append(
+                    f"roles.{role}.{field} не задан; отсутствующий параметр записывается как "
+                    f'{{"mode": "{MODE_UNSET}"}}, а не подставляется значением'
+                )
+                parsed[field] = {"mode": MODE_UNSET}
+                continue
+            entry, field_errors = parse_profile_value(settings[field], f"roles.{role}.{field}")
+            errors.extend(field_errors)
+            parsed[field] = entry
+        typed_roles[role] = parsed
+        agent = settings.get("agent").strip() if isinstance(settings.get("agent"), str) else ""
+        executes = bool(agent) and agent not in NON_EXECUTING_AGENTS
+        for field in TYPED_PROFILE_FIELDS:
+            mode = parsed[field]["mode"]
+            if agent and not executes and mode != MODE_NOT_APPLICABLE:
+                errors.append(
+                    f"roles.{role}.{field}: агент {agent} не исполняет модель, "
+                    f"требуется mode={MODE_NOT_APPLICABLE} без исполняемого значения"
+                )
+            if executes and mode == MODE_NOT_APPLICABLE:
+                errors.append(
+                    f"roles.{role}.{field}: mode={MODE_NOT_APPLICABLE} недопустим для исполняющего агента {agent}"
+                )
+    legacy_pointers = config_uses_legacy_profile(config)
+    if legacy_pointers:
+        warnings.append(
+            "Нетипизированные model/effort требуют нормализации через `devflow config normalize`: "
+            + ", ".join(legacy_pointers)
+        )
     models = config.get("models", {})
     if not isinstance(models, dict):
         errors.append("config.models должен быть объектом")
@@ -1016,15 +1445,15 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
         errors.append("models.available должен быть массивом строк")
         available = []
     checked = models.get("availability_checked_at")
-    for role, settings in roles.items():
-        model = settings.get("model") if isinstance(settings, dict) else None
-        if model == "inherit" and settings.get("agent") != "human":
-            warnings.append(
-                f"Модель для роли {role} наследуется; фактические model и effort должны быть проверены и записаны при запуске"
-            )
+    for role, parsed in typed_roles.items():
+        entry = parsed.get("model", {"mode": MODE_UNSET})
+        mode = entry.get("mode")
+        # A declared `inherited` or `unset` mode is a decision, not a gap: there is no
+        # value to verify against a model list.  Honesty is enforced when evidence is
+        # recorded, where the actually observed value must be supplied.
+        if mode != MODE_EXPLICIT:
             continue
-        if model in {None, "not-applicable"}:
-            continue
+        model = entry.get("value")
         if available and model not in available:
             errors.append(f"Модель {model} для роли {role} не входит в проверенный список доступных")
         elif not checked:
@@ -1039,9 +1468,13 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
             if not isinstance(node_id, str) or not isinstance(settings, dict):
                 errors.append(f"Некорректная настройка node_overrides.{node_id}")
                 continue
-            for field in ["agent", "model", "effort", "permissions"]:
-                if field in settings and (not isinstance(settings[field], str) or not settings[field]):
+            for field in ["agent", "permissions"]:
+                if field in settings and (not isinstance(settings[field], str) or not settings[field].strip()):
                     errors.append(f"node_overrides.{node_id}.{field} должен быть непустой строкой")
+            for field in TYPED_PROFILE_FIELDS:
+                if field in settings:
+                    _, field_errors = parse_profile_value(settings[field], f"node_overrides.{node_id}.{field}")
+                    errors.extend(field_errors)
     for field in ["quality", "github", "automation", "telemetry"]:
         if field in config and not isinstance(config[field], dict):
             errors.append(f"config.{field} должен быть объектом")
@@ -1240,6 +1673,66 @@ def validate_workflow(workflow: dict[str, Any], config: dict[str, Any]) -> tuple
         evidence = set(node.get("expected_evidence", []))
         if not {"verified_head_sha", "required_checks_green"}.issubset(evidence):
             errors.append(f"Merge gate {node.get('id')} не требует verified_head_sha и required_checks_green вместе")
+    # A review node must declare which artifact proves it ran: a successful job without
+    # the configured review, comment, or findings artifact is not a passed check.
+    for node_id, node in nodes.items():
+        contract = node.get("evidence_contract")
+        if contract is not None and not isinstance(contract, dict):
+            errors.append(f"Узел {node_id}: evidence_contract должен быть объектом")
+            contract = None
+        contract = contract or {}
+        declared = node.get("expected_evidence")
+        declared = set(declared) if isinstance(declared, list) else set()
+        for name, requirement in contract.items():
+            if not isinstance(requirement, dict):
+                errors.append(f"Узел {node_id}: контракт артефакта {name} должен быть объектом")
+                continue
+            if name not in declared:
+                errors.append(f"Узел {node_id}: контракт артефакта {name} не объявлен в expected_evidence")
+            kind = requirement.get("kind")
+            if kind not in REVIEW_ARTIFACT_KINDS:
+                errors.append(
+                    f"Узел {node_id}: вид артефакта {kind} неизвестен; допустимы: "
+                    + ", ".join(sorted(REVIEW_ARTIFACT_KINDS))
+                )
+            if "required" in requirement and not isinstance(requirement["required"], bool):
+                errors.append(f"Узел {node_id}: поле required контракта {name} должно быть булевым")
+        if node.get("stage") == "review" and not any(
+            isinstance(requirement, dict) and requirement.get("required", True)
+            for requirement in contract.values()
+        ):
+            # A graph written before this contract existed stays valid so the project can
+            # still run doctor, upgrade and the migration.  The gate is enforced where it
+            # matters instead: such a node cannot record a PASS.
+            warnings.append(
+                f"Review-узел {node_id} не требует ни одного обязательного артефакта; "
+                "PASS для него запрещён до миграции графа командой `devflow graph --migrate --apply`"
+            )
+        for field in TYPED_PROFILE_FIELDS:
+            if field in node:
+                errors.append(
+                    f"Узел {node_id}: {field} задаётся в config.json через roles или node_overrides, "
+                    "а не в графе; значение внутри узла молча игнорировалось бы"
+                )
+        # The executing-agent rule has to hold for the value that actually resolves, not
+        # only for the role default: a node override can pair an executing agent with
+        # `not-applicable`, or a non-executing agent with a real model.
+        resolution = resolve_execution_profile(node, config if isinstance(config, dict) else {})
+        agent = resolution["agent"].get("value")
+        executes = resolution.get("executes_model")
+        for field in TYPED_PROFILE_FIELDS:
+            mode = resolution[field].get("mode")
+            pointer = resolution[field].get("source", {}).get("pointer") or field
+            if agent and not executes and mode != MODE_NOT_APPLICABLE:
+                errors.append(
+                    f"Узел {node_id}: агент {agent} не исполняет модель, но {pointer} имеет mode={mode}; "
+                    f"требуется mode={MODE_NOT_APPLICABLE}"
+                )
+            if agent and executes and mode == MODE_NOT_APPLICABLE:
+                errors.append(
+                    f"Узел {node_id}: {pointer} объявлен mode={MODE_NOT_APPLICABLE}, "
+                    f"хотя агент {agent} исполняет модель; фактическое значение было бы нечем проверить"
+                )
     return errors, warnings
 
 
@@ -1350,17 +1843,10 @@ def load_project_or_proposed_state(repo: Path) -> tuple[dict[str, Any], dict[str
 
 def effective_node(node: dict[str, Any], config: dict[str, Any], lock: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(node)
-    roles = config.get("roles", {}) if isinstance(config, dict) else {}
-    roles = roles if isinstance(roles, dict) else {}
-    role = roles.get(node.get("role"), {})
-    role = role if isinstance(role, dict) else {}
-    overrides = config.get("node_overrides", {}) if isinstance(config, dict) else {}
-    overrides = overrides if isinstance(overrides, dict) else {}
-    override = overrides.get(node.get("id"), {})
-    override = override if isinstance(override, dict) else {}
-    for field in ["agent", "model", "effort"]:
-        result[field] = override.get(field, role.get(field, "unconfigured"))
-    result["permissions"] = override.get("permissions", node.get("permissions", role.get("permissions", "unconfigured")))
+    resolution = resolve_execution_profile(node, config if isinstance(config, dict) else {})
+    for field in PROFILE_FIELDS:
+        result[field] = profile_display(resolution[field])
+    result["resolution"] = resolution
     decisions = lock.get("node_decisions", {}) if isinstance(lock, dict) else {}
     decisions = decisions if isinstance(decisions, dict) else {}
     decision = decisions.get(node.get("id"), {"status": "unresolved", "assigned": []})
@@ -1419,6 +1905,131 @@ def render_graph(workflow: dict[str, Any], config: dict[str, Any], lock: dict[st
         ):
             lines.append(f"  {edge['from']} -.->|\"on failure / retries exhausted\"| {failure}")
     return "\n".join(lines)
+
+
+EFFECTIVE_MATRIX_CELLS = (
+    "stage", "state", "owner", "agent", "agent_mode",
+    "model", "model_mode", "effort", "effort_mode", "permissions",
+)
+
+
+def effective_configuration(workflow: dict[str, Any], config: dict[str, Any], lock: dict[str, Any]) -> dict[str, Any]:
+    """Build the stage/owner/agent/model/effort matrix with per-cell provenance."""
+    rows: list[dict[str, Any]] = []
+    for node in workflow.get("nodes", []) if isinstance(workflow, dict) else []:
+        if not isinstance(node, dict):
+            continue
+        resolution = resolve_execution_profile(node, config if isinstance(config, dict) else {})
+        row: dict[str, Any] = {
+            "node": node.get("id"),
+            "stage": node.get("stage"),
+            "state": node.get("state"),
+            "owner": node.get("role"),
+            "executes_model": resolution.get("executes_model"),
+        }
+        for field in PROFILE_FIELDS:
+            entry = resolution[field]
+            origin = entry.get("source", {})
+            row[field] = entry.get("value")
+            row[f"{field}_mode"] = entry.get("mode")
+            row[f"{field}_source"] = origin.get("pointer")
+            row[f"{field}_source_file"] = origin.get("file")
+            row[f"{field}_source_level"] = origin.get("level")
+        rows.append(row)
+    return {
+        "schema_version": 1,
+        "sources": {"config": CONFIG_PATH, "workflow": WORKFLOW_PATH, "lock": SKILLS_LOCK_PATH},
+        "rows": rows,
+    }
+
+
+def effective_configuration_from_files(repo: Path) -> dict[str, Any]:
+    """Rebuild the matrix from what is actually on disk, never from an in-memory plan."""
+    config, workflow, lock = load_project_state(repo)
+    return effective_configuration(workflow, config, lock)
+
+
+def render_effective_configuration(matrix: dict[str, Any], output_format: str = "table") -> str:
+    if output_format == "json":
+        return json.dumps(matrix, ensure_ascii=False, indent=2)
+    lines = [
+        "| Узел | Этап | Владелец | Agent | Model | Model mode | Model источник | Effort | Effort mode | Effort источник |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in matrix.get("rows", []):
+        lines.append(
+            f"| {row.get('node')} | {row.get('stage')} | {row.get('owner')} | "
+            f"{row.get('agent') or row.get('agent_mode')} | "
+            f"{row.get('model') or '—'} | {row.get('model_mode')} | {row.get('model_source') or '—'} | "
+            f"{row.get('effort') or '—'} | {row.get('effort_mode')} | {row.get('effort_source') or '—'} |"
+        )
+    return "\n".join(lines)
+
+
+def projected_project_state(repo: Path, plan: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """Read the control plane the plan would produce: planned bytes first, disk second."""
+    payload = {
+        operation.get("path"): operation
+        for operation in plan.get("operations", [])
+        if isinstance(operation, dict) and operation.get("action") != "delete"
+    }
+
+    def read(relative: str) -> Any:
+        operation = payload.get(relative)
+        if operation is not None and isinstance(operation.get("content_b64"), str):
+            try:
+                return json.loads(base64.b64decode(operation["content_b64"]).decode("utf-8"))
+            except (ValueError, binascii.Error, UnicodeDecodeError):
+                return None
+        path = repo / relative
+        if path.is_file():
+            try:
+                return load_json(path)
+            except DevflowError:
+                return None
+        return None
+
+    return read(CONFIG_PATH), read(WORKFLOW_PATH), read(SKILLS_LOCK_PATH)
+
+
+def attach_effective_configuration(repo: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    """Record the matrix the plan promises, so verify can rebuild it from the files.
+
+    Only plans that actually rewrite the control plane carry it: stamping the whole-repo
+    matrix onto an unrelated run would make that run verify BLOCKED after any later
+    authorized configuration change.
+    """
+    touched = {
+        operation.get("path") for operation in plan.get("operations", [])
+        if isinstance(operation, dict)
+    }
+    if not touched.intersection({CONFIG_PATH, WORKFLOW_PATH}):
+        return plan
+    config, workflow, lock = projected_project_state(repo, plan)
+    if not isinstance(config, dict) or not isinstance(workflow, dict):
+        return plan
+    plan["effective_configuration"] = effective_configuration(workflow, config, lock if isinstance(lock, dict) else {})
+    return plan
+
+
+def compare_effective_configuration(expected: Any, actual: Any) -> list[str]:
+    """Compare two matrices cell by cell.  Any difference must block, never fall back."""
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return ["Матрица эффективной конфигурации недоступна для сравнения"]
+    expected_rows = {row.get("node"): row for row in expected.get("rows", []) if isinstance(row, dict)}
+    actual_rows = {row.get("node"): row for row in actual.get("rows", []) if isinstance(row, dict)}
+    differences: list[str] = []
+    for node in sorted(set(expected_rows) - set(actual_rows), key=str):
+        differences.append(f"{node}: узел отсутствует в фактических файлах")
+    for node in sorted(set(actual_rows) - set(expected_rows), key=str):
+        differences.append(f"{node}: узел появился в файлах, но отсутствовал в утверждённом плане")
+    for node in sorted(set(expected_rows) & set(actual_rows), key=str):
+        for cell in EFFECTIVE_MATRIX_CELLS:
+            want = expected_rows[node].get(cell)
+            got = actual_rows[node].get(cell)
+            if want != got:
+                differences.append(f"{node}.{cell}: план={want!r}, файлы={got!r}")
+    return differences
 
 
 def source_allowed(source: str, lock: dict[str, Any]) -> bool:
@@ -1595,6 +2206,126 @@ def expected_target_for_agent(agent: str) -> str | None:
     if "codex" in lowered or "openai" in lowered:
         return "codex"
     return None
+
+
+SKILL_PUBLIC_NAME = "vibecode-control"
+# Where each client loads a personal skill from.  The project-scoped roots live in
+# `target_skill_path`; these are the user-level ones.
+PERSONAL_SKILL_ROOTS = {
+    "codex": (".agents", "skills"),
+    "claude": (".claude", "skills"),
+}
+
+
+def skill_source_root() -> Path:
+    """The root of this skill: the directory that holds SKILL.md, scripts and assets."""
+    override = os.environ.get("DEVFLOW_SKILL_ROOT")
+    root = Path(override).resolve() if override else Path(__file__).resolve().parent.parent
+    if not (root / "SKILL.md").is_file() or not (root / "assets" / "project-kit").is_dir():
+        raise DevflowError(f"Каталог не выглядит корнем скилла VibeCode Control: {root}")
+    return root
+
+
+def personal_skill_target(client: str, home: Path | None = None) -> Path:
+    if client not in PERSONAL_SKILL_ROOTS:
+        raise DevflowError(
+            f"Неизвестный клиент: {client}; поддерживаются " + ", ".join(sorted(PERSONAL_SKILL_ROOTS))
+        )
+    base = home.resolve() if home is not None else Path.home()
+    return base.joinpath(*PERSONAL_SKILL_ROOTS[client], SKILL_PUBLIC_NAME)
+
+
+def install_skill(client: str, apply: bool = False, home: Path | None = None,
+                  force: bool = False) -> dict[str, Any]:
+    """Install or update this skill as a personal skill for one client.
+
+    The plan is shown before anything is written, the target is confined to that
+    client's own skills directory, and the result is verified by re-hashing the
+    installed tree against the source.
+    """
+    source = skill_source_root()
+    target = personal_skill_target(client, home)
+    root = target.parent
+    if target.exists() and target.is_symlink():
+        raise DevflowError(f"Целевой путь — symlink, установка запрещена: {target}")
+    if target.exists() and not target.is_dir():
+        raise DevflowError(f"Целевой путь занят файлом: {target}")
+    existing_marker = target / "SKILL.md"
+    if target.is_dir() and existing_marker.is_file():
+        declared = read_small_text(existing_marker)
+        if f"name: {SKILL_PUBLIC_NAME}" not in declared and not force:
+            raise DevflowError(
+                f"В {target} уже установлен другой скилл; повторите с --force, чтобы заменить его"
+            )
+    elif target.is_dir() and any(target.iterdir()) and not force:
+        raise DevflowError(
+            f"Каталог {target} не пуст и не содержит SKILL.md; повторите с --force, чтобы заменить его"
+        )
+
+    source_files = {
+        path.relative_to(source).as_posix(): path
+        for path in iter_files(source)
+    }
+    installed = iter_skill_files(target) if target.is_dir() else []
+    if installed is None:
+        raise DevflowError(f"Установленная копия содержит symlink или недоступный файл: {target}")
+    existing = {path.relative_to(target).as_posix(): path for path in installed}
+
+    create = sorted(name for name in source_files if name not in existing)
+    update = sorted(
+        name for name in source_files
+        if name in existing and existing[name].read_bytes() != source_files[name].read_bytes()
+    )
+    remove = sorted(name for name in existing if name not in source_files)
+    total_bytes = sum(path.stat().st_size for path in source_files.values())
+    report: dict[str, Any] = {
+        "client": client,
+        "skill": SKILL_PUBLIC_NAME,
+        "source": str(source),
+        "target": str(target),
+        "file_count": len(source_files),
+        "total_bytes": total_bytes,
+        # Checksum the installable file set, not the raw tree: the source is a git
+        # checkout and must not have `.git` folded into its identity.
+        "source_checksum": hash_file_map(source_files),
+        "installed_checksum": hash_file_map(existing),
+        "create": create,
+        "update": update,
+        "remove": remove,
+    }
+    report["up_to_date"] = not (create or update or remove)
+    if not apply:
+        report["status"] = "PASS" if report["up_to_date"] else "PARTIAL"
+        report["applied"] = False
+        report["dry_run"] = True
+        report["next_command"] = f"devflow install --client {client} --apply"
+        return report
+    root.mkdir(parents=True, exist_ok=True)
+    for name in remove:
+        existing[name].unlink()
+    for name in sorted(source_files):
+        destination = target / name
+        if root.resolve() not in destination.resolve().parents:
+            raise DevflowError(f"Операция установки вышла за пределы каталога клиента: {destination}")
+        atomic_write(destination, source_files[name].read_bytes())
+    for current, _, _ in os.walk(target, topdown=False):
+        path = Path(current)
+        if path != target and not any(path.iterdir()):
+            path.rmdir()
+    reinstalled = iter_skill_files(target) or []
+    report["installed_checksum"] = hash_file_map(
+        {path.relative_to(target).as_posix(): path for path in reinstalled}
+    )
+    report["applied"] = True
+    report["dry_run"] = False
+    verified = report["installed_checksum"] == report["source_checksum"] and bool(report["source_checksum"])
+    report["status"] = "PASS" if verified else "BLOCKED"
+    if not verified:
+        report["error"] = "Контрольная сумма установленной копии не совпала с источником"
+    report["invocation"] = (
+        f"$ {SKILL_PUBLIC_NAME} ..." if client == "codex" else f"Skill: {SKILL_PUBLIC_NAME}"
+    )
+    return report
 
 
 def skills_audit(repo: Path, node: str | None = None, deep: bool = False) -> dict[str, Any]:
@@ -1810,7 +2541,7 @@ def copy_tree_operations(repo: Path, source: Path, relative_target: str, delete_
 
 def one_file_plan(repo: Path, relative: str, data: bytes, purpose: str) -> dict[str, Any]:
     operation = make_operation(repo, relative, data)
-    return {
+    return attach_effective_configuration(repo, {
         "schema_version": 1,
         "devflow_version": VERSION,
         "run_id": run_id(purpose),
@@ -1820,7 +2551,7 @@ def one_file_plan(repo: Path, relative: str, data: bytes, purpose: str) -> dict[
         "fingerprint": repo_fingerprint(repo),
         "operations": [operation] if operation else [],
         "warnings": [],
-    }
+    })
 
 
 def write_project_json(repo: Path, relative: str, value: Any, purpose: str) -> dict[str, Any]:
@@ -2082,7 +2813,7 @@ def apply_json_updates(repo: Path, values: dict[str, Any], purpose: str) -> dict
             operations.append(operation)
     if not operations:
         return {"status": "PASS", "changed": 0, "run_id": None}
-    plan = {
+    plan = attach_effective_configuration(repo, {
         "schema_version": 1,
         "devflow_version": VERSION,
         "run_id": run_id(purpose),
@@ -2092,8 +2823,11 @@ def apply_json_updates(repo: Path, values: dict[str, Any], purpose: str) -> dict
         "fingerprint": repo_fingerprint(repo),
         "operations": operations,
         "warnings": [],
-    }
-    return apply_plan(repo, plan)
+    })
+    result = apply_plan(repo, plan)
+    if isinstance(plan.get("effective_configuration"), dict):
+        result["effective_configuration"] = plan["effective_configuration"]
+    return result
 
 
 def mark_skill_revalidation(config: dict[str, Any], workflow: dict[str, Any], lock: dict[str, Any], target: str) -> None:
@@ -2125,6 +2859,9 @@ def configure_role(repo: Path, role: str, agent: str) -> dict[str, Any]:
     if role not in config.get("roles", {}):
         raise DevflowError(f"Неизвестная роль: {role}")
     config["roles"][role]["agent"] = agent
+    errors, _ = validate_config(config)
+    if errors:
+        raise DevflowError("Конфигурация после изменения невалидна: " + "; ".join(errors))
     mark_skill_revalidation(config, workflow, lock, role)
     return apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "role-set")
 
@@ -2132,19 +2869,128 @@ def configure_role(repo: Path, role: str, agent: str) -> dict[str, Any]:
 def configure_model(repo: Path, target: str, model: str, effort: str | None) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     node_ids = {node["id"] for node in workflow["nodes"]}
+    parsed_model, model_errors = parse_profile_value(model, f"{target}.model")
+    if model_errors:
+        raise DevflowError("; ".join(model_errors))
+    parsed_effort = None
+    if effort:
+        parsed_effort, effort_errors = parse_profile_value(effort, f"{target}.effort")
+        if effort_errors:
+            raise DevflowError("; ".join(effort_errors))
     if target in config.get("roles", {}):
-        config["roles"][target]["model"] = model
-        if effort:
-            config["roles"][target]["effort"] = effort
+        config["roles"][target]["model"] = parsed_model
+        if parsed_effort is not None:
+            config["roles"][target]["effort"] = parsed_effort
     elif target in node_ids:
         override = config.setdefault("node_overrides", {}).setdefault(target, {})
-        override["model"] = model
-        if effort:
-            override["effort"] = effort
+        override["model"] = parsed_model
+        if parsed_effort is not None:
+            override["effort"] = parsed_effort
     else:
         raise DevflowError(f"Неизвестная роль или узел: {target}")
+    errors, _ = validate_config(config)
+    if errors:
+        raise DevflowError("Конфигурация после изменения невалидна: " + "; ".join(errors))
     mark_skill_revalidation(config, workflow, lock, target)
     return apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "model-set")
+
+
+def migrate_graph_contracts(repo: Path, apply: bool = False, full_diff: bool = False) -> dict[str, Any]:
+    """Add the missing review-artifact contracts to a graph written before this contract.
+
+    Only node ids that exist in the canonical kit graph are migrated, and only by copying
+    that graph's declaration.  A review node this tool does not ship is reported for an
+    explicit decision instead of being given a guessed artifact kind.
+    """
+    workflow = load_json(repo / WORKFLOW_PATH)
+    template = load_json(find_project_kit(repo) / "workflow.json")
+    canonical = {
+        node.get("id"): node.get("evidence_contract")
+        for node in template.get("nodes", []) if isinstance(node, dict)
+    }
+    migrated: list[str] = []
+    undecided: list[str] = []
+    for node in workflow.get("nodes", []):
+        if not isinstance(node, dict) or node.get("stage") != "review":
+            continue
+        contract = node.get("evidence_contract")
+        if isinstance(contract, dict) and any(
+            isinstance(item, dict) and item.get("required", True) for item in contract.values()
+        ):
+            continue
+        proposed = canonical.get(node.get("id"))
+        declared = node.get("expected_evidence") if isinstance(node.get("expected_evidence"), list) else []
+        if isinstance(proposed, dict) and set(proposed).issubset(set(declared)):
+            node["evidence_contract"] = copy.deepcopy(proposed)
+            migrated.append(str(node.get("id")))
+        else:
+            undecided.append(str(node.get("id")))
+    if not migrated:
+        return {
+            "status": "BLOCKED" if undecided else "NOT_APPLICABLE",
+            "migrated": [],
+            "requires_explicit_decision": undecided,
+            "note": (
+                "Для этих review-узлов нет канонического контракта: добавьте evidence_contract "
+                "в .agent-flow/workflow.json явно, указав имя из expected_evidence и вид артефакта "
+                + ", ".join(sorted(REVIEW_ARTIFACT_KINDS))
+                if undecided else "Граф уже объявляет обязательные артефакты review-узлов"
+            ),
+        }
+    errors, _ = validate_workflow(workflow, load_json(repo / CONFIG_PATH))
+    if errors:
+        return {"status": "BLOCKED", "errors": errors, "migrated": migrated}
+    plan = one_file_plan(repo, WORKFLOW_PATH, json_bytes(workflow), "graph-migrate")
+    if not apply:
+        return {
+            "status": "PARTIAL",
+            "applied": False,
+            "migrated": migrated,
+            "requires_explicit_decision": undecided,
+            "plan": summarize_plan(repo, plan, full_diff=full_diff),
+            "next_command": "devflow graph --migrate --apply",
+        }
+    result = apply_plan(repo, plan)
+    result["migrated"] = migrated
+    result["requires_explicit_decision"] = undecided
+    result["applied"] = True
+    if undecided:
+        result["status"] = "PARTIAL"
+    return result
+
+
+def normalize_project_config(repo: Path, apply: bool = False, full_diff: bool = False) -> dict[str, Any]:
+    """Migrate an installed project to the typed model/effort contract."""
+    config = load_json(repo / CONFIG_PATH)
+    legacy = config_uses_legacy_profile(config)
+    normalized, errors = normalize_config(config)
+    if errors:
+        return {"status": "BLOCKED", "errors": errors, "legacy": legacy}
+    plan = one_file_plan(repo, CONFIG_PATH, json_bytes(normalized), "config-set")
+    if not plan["operations"]:
+        return {
+            "status": "NOT_APPLICABLE",
+            "legacy": legacy,
+            "note": "Конфигурация уже записана в типизированной форме",
+        }
+    validation_errors, validation_warnings = validate_config(normalized)
+    if validation_errors:
+        return {"status": "BLOCKED", "errors": validation_errors, "legacy": legacy}
+    summary = summarize_plan(repo, plan, full_diff=full_diff)
+    if not apply:
+        return {
+            "status": "PARTIAL",
+            "applied": False,
+            "legacy": legacy,
+            "warnings": validation_warnings,
+            "plan": summary,
+            "next_command": "devflow config normalize --apply",
+        }
+    result = apply_plan(repo, plan)
+    result["legacy"] = legacy
+    result["warnings"] = validation_warnings
+    result["applied"] = True
+    return result
 
 
 def configure_permissions(repo: Path, target: str, profile: str) -> dict[str, Any]:
@@ -2156,6 +3002,9 @@ def configure_permissions(repo: Path, target: str, profile: str) -> dict[str, An
         config.setdefault("node_overrides", {}).setdefault(target, {})["permissions"] = profile
     else:
         raise DevflowError(f"Неизвестная роль или узел: {target}")
+    errors, _ = validate_config(config)
+    if errors:
+        raise DevflowError("Конфигурация после изменения невалидна: " + "; ".join(errors))
     mark_skill_revalidation(config, workflow, lock, target)
     return apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "permissions-set")
 
@@ -2429,6 +3278,53 @@ def summarize_plan(repo: Path, plan: dict[str, Any], full_diff: bool = False,
         "diff_mode": "full" if full_diff else "bounded-preview",
         "operations": rendered_operations,
         "warnings": plan.get("warnings", []),
+        "effective_configuration": plan.get("effective_configuration"),
+    }
+
+
+def managed_block_report(repo: Path) -> dict[str, Any]:
+    """Check the generated role-aware managed blocks against the current configuration."""
+    if not (repo / CONFIG_PATH).is_file() or not (repo / WORKFLOW_PATH).is_file():
+        return {"check": "managed-blocks", "status": "NOT_APPLICABLE", "details": []}
+    try:
+        config = load_json(repo / CONFIG_PATH)
+        workflow = load_json(repo / WORKFLOW_PATH)
+    except DevflowError as exc:
+        return {"check": "managed-blocks", "status": "BLOCKED", "details": [str(exc)]}
+    expected_blocks = {
+        "CLAUDE.md": render_client_role_block(config, workflow, "claude", "Claude roles in this project"),
+    }
+    try:
+        kit_agents = find_project_kit(repo) / "managed" / "AGENTS.block.md"
+    except DevflowError:
+        kit_agents = None
+    if kit_agents is not None and kit_agents.is_file():
+        expected_blocks["AGENTS.md"] = kit_agents.read_text(encoding="utf-8")
+    details: list[dict[str, Any]] = []
+    status = "PASS"
+    for relative, expected in sorted(expected_blocks.items()):
+        path = repo / relative
+        if not path.is_file():
+            details.append({"path": relative, "state": "missing"})
+            status = "BLOCKED"
+            continue
+        current = extract_managed_block(path.read_text(encoding="utf-8", errors="replace"))
+        if current is None:
+            details.append({"path": relative, "state": "markers-missing-or-duplicated"})
+            status = "BLOCKED"
+            continue
+        if current != expected.strip() + "\n":
+            details.append({"path": relative, "state": "stale"})
+            if status != "BLOCKED":
+                status = "PARTIAL"
+    return {
+        "check": "managed-blocks",
+        "status": status,
+        "details": details,
+        "recommendation": (
+            "Regenerate the managed instructions with `devflow upgrade` so they match the configured roles."
+            if details else "Managed instructions match the configured roles."
+        ),
     }
 
 
@@ -2534,6 +3430,7 @@ def doctor(repo: Path, deep: bool = False, refresh_skills: bool = False, repair_
     toolkit = repo / META_DIR / "toolkit"
     configured_version = config.get("devflow_version") if isinstance(config, dict) else None
     findings.append({"check": "project-cli", "status": "PASS" if (repo / META_DIR / "devflow.py").is_file() and toolkit.is_dir() else "BLOCKED", "version": configured_version, "running_version": VERSION})
+    findings.append(managed_block_report(repo))
 
     due = []
     today = utc_now().date()
@@ -2585,6 +3482,52 @@ def doctor(repo: Path, deep: bool = False, refresh_skills: bool = False, repair_
     return response
 
 
+GUARDED_EXECUTION_PATHS = (
+    f"{META_DIR}/",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".github/workflows/",
+    ".github/devflow/prompts/",
+    ".agents/skills/devflow-node/",
+    ".claude/skills/devflow-node/",
+)
+
+
+def guarded_control_plane_changes(repo: Path) -> dict[str, Any]:
+    """Report whether the current branch rewrites the control plane that governs it.
+
+    A PR that edits its own verifier must be reviewed against the version that actually
+    executed, so this is surfaced as evidence rather than guessed at.
+    """
+    candidates: list[str] = []
+    code, symbolic, _ = run_process(["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], repo)
+    if code == 0 and symbolic.strip():
+        candidates.append(symbolic.strip().removeprefix("refs/remotes/"))
+    candidates += ["origin/main", "origin/master", "main", "master"]
+    for candidate in candidates:
+        code, merge_base, _ = run_process(["git", "merge-base", candidate, "HEAD"], repo)
+        if code != 0 or not merge_base.strip():
+            continue
+        code, names, _ = run_process(["git", "diff", "--name-only", merge_base.strip(), "HEAD"], repo)
+        if code != 0:
+            continue
+        changed = [line.strip() for line in names.splitlines() if line.strip()]
+        guarded = sorted({path for path in changed if path.startswith(GUARDED_EXECUTION_PATHS)})
+        return {
+            "base": candidate,
+            "merge_base": merge_base.strip(),
+            "guarded_paths": guarded,
+            "self_modifying": bool(guarded),
+        }
+    return {
+        "base": None,
+        "merge_base": None,
+        "guarded_paths": [],
+        "self_modifying": None,
+        "note": "Базовая версия не определена локально; сравнение base/head выполняется на стороне адаптера GitHub",
+    }
+
+
 def operate_preflight(repo: Path, node_id: str) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     config_errors, config_warnings = validate_config(config)
@@ -2634,6 +3577,9 @@ def operate_preflight(repo: Path, node_id: str) -> dict[str, Any]:
     return {
         "status": status,
         "node": effective,
+        "effective_configuration": effective_configuration(workflow, config, lock),
+        "self_modification": guarded_control_plane_changes(repo),
+        "required_artifacts": evidence_contract_for(nodes[node_id]),
         "config": {"errors": config_errors, "warnings": config_warnings},
         "workflow": {"errors": workflow_errors, "warnings": workflow_warnings},
         "skills": skill_report,
@@ -2737,9 +3683,34 @@ def scheme_check(repo: Path, refresh_skills: bool = True) -> dict[str, Any]:
     }
 
 
+def parse_check_results(items: list[str] | None) -> dict[str, str]:
+    """Parse `--check name=conclusion` pairs.  A job status alone proves nothing."""
+    results: dict[str, str] = {}
+    for item in items or []:
+        if not isinstance(item, str) or "=" not in item:
+            raise DevflowError("Проверка записывается как name=conclusion")
+        name, conclusion = (part.strip() for part in item.split("=", 1))
+        if not name or not conclusion:
+            raise DevflowError("Проверка записывается как name=conclusion")
+        if conclusion not in CHECK_CONCLUSIONS:
+            raise DevflowError(
+                f"Неизвестный conclusion {conclusion} для проверки {name}; допустимы: "
+                + ", ".join(sorted(CHECK_CONCLUSIONS))
+            )
+        if name in results:
+            raise DevflowError(f"Повторная проверка {name}")
+        results[name] = conclusion
+    return results
+
+
+def evidence_contract_for(node: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    contract = node.get("evidence_contract")
+    return contract if isinstance(contract, dict) else {}
+
+
 def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr: str,
                evidence: list[str], actual_agent: str | None, actual_model: str | None,
-               actual_effort: str | None) -> dict[str, Any]:
+               actual_effort: str | None, checks: list[str] | None = None) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     nodes = {item["id"]: item for item in workflow["nodes"]}
     if node not in nodes:
@@ -2750,6 +3721,7 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
         raise DevflowError("Некорректный статус run record")
     if not evidence or not all(isinstance(item, str) and item.strip() for item in evidence):
         raise DevflowError("Run record требует хотя бы одно непустое доказательство")
+    check_results = parse_check_results(checks)
     stage = nodes[node].get("stage")
     evidence_by_name: dict[str, str] = {}
     if status == "PASS" and stage in {"implementation", "verification", "review", "release"}:
@@ -2763,8 +3735,8 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
             raise DevflowError("PASS требует чистый Git worktree, соответствующий указанному HEAD")
         if not issue or not pr:
             raise DevflowError("PASS для delivery-узла требует Issue и PR reference")
-        if not actual_agent or not actual_model or not actual_effort:
-            raise DevflowError("PASS требует фактически наблюдённые agent, model и effort")
+        if not actual_agent:
+            raise DevflowError("PASS требует фактически наблюдённого agent")
         for item in evidence:
             if "=" not in item:
                 raise DevflowError("PASS требует именованные доказательства в формате expected_evidence=artifact")
@@ -2776,21 +3748,102 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
         missing = sorted(expected_names - set(evidence_by_name))
         if missing:
             raise DevflowError("PASS не содержит обязательные доказательства: " + ", ".join(missing))
+        # A green job is not a passed check: every contracted review artifact must be
+        # present and must name its kind, and every required check must actually be
+        # concluded `success`.
+        contract = evidence_contract_for(nodes[node])
+        if stage == "review" and not any(
+            isinstance(requirement, dict) and requirement.get("required", True)
+            for requirement in contract.values()
+        ):
+            raise DevflowError(
+                f"PASS запрещён: review-узел {node} не объявляет обязательный артефакт, "
+                "поэтому успешный запуск ничем не подтверждён; выполните `devflow graph --migrate --apply`"
+            )
+        for name, requirement in sorted(contract.items()):
+            if not isinstance(requirement, dict):
+                raise DevflowError(f"Контракт артефакта {name} повреждён")
+            if not requirement.get("required", True):
+                continue
+            kind = requirement.get("kind")
+            reference = evidence_by_name.get(name, "")
+            if not reference:
+                raise DevflowError(
+                    f"PASS запрещён: успешный запуск без обязательного артефакта {name} ({kind}) не является пройденной проверкой"
+                )
+            if not reference.startswith(f"{kind}:") or not reference[len(str(kind)) + 1:].strip():
+                raise DevflowError(
+                    f"Артефакт {name} должен быть записан как {kind}:<ссылка>, чтобы его вид был доказан"
+                )
+        # Checks are gated only where green is the expected outcome.  On an implementation
+        # stage a failing check can be the point of the node: `tdd_red` must prove a test
+        # that fails, so its conclusions are recorded as evidence and not judged here.
+        if stage in CHECK_GATED_STAGES:
+            for name, conclusion in sorted(check_results.items()):
+                if conclusion not in PROVEN_CHECK_CONCLUSIONS:
+                    raise DevflowError(
+                        f"PASS запрещён: проверка {name} завершилась как {conclusion}; "
+                        "зелёный skipped или neutral не считается выполненной проверкой"
+                    )
+            required_checks = config.get("github", {}).get("required_checks", []) if isinstance(config.get("github"), dict) else []
+            if isinstance(required_checks, list) and required_checks:
+                unproven = sorted(str(name) for name in required_checks if check_results.get(str(name)) not in PROVEN_CHECK_CONCLUSIONS)
+                if unproven:
+                    raise DevflowError(
+                        "PASS требует conclusion=success для каждой обязательной проверки: " + ", ".join(unproven)
+                    )
+        if node == "post_merge" or nodes[node].get("state") == "POST_MERGE_VERIFY":
+            # A closed PR has no refs/pull/<N>/merge; a control dispatch against it
+            # fabricates a result instead of proving one.  This is a post-merge rule only:
+            # before the merge the same ref is the canonical merge-gate reference.
+            for name, reference in sorted(evidence_by_name.items()):
+                if re.search(r"refs/pull/\d+/merge", reference):
+                    raise DevflowError(
+                        f"Доказательство {name} ссылается на refs/pull/<N>/merge; "
+                        "post-merge проверка не запускается на закрытом PR"
+                    )
         preflight = operate_preflight(repo, node)
         if preflight["status"] != "PASS":
-            raise DevflowError(
-                "PASS запрещён: operate preflight не прошёл: "
-                + "; ".join(preflight.get("external_gaps", []) + preflight.get("skills", {}).get("errors", []))
+            reasons = (
+                preflight.get("external_gaps", [])
+                + preflight.get("skills", {}).get("errors", [])
+                + preflight.get("skills", {}).get("warnings", [])
+                + preflight.get("config", {}).get("errors", [])
+                + preflight.get("config", {}).get("warnings", [])
+                + preflight.get("workflow", {}).get("errors", [])
+                + preflight.get("workflow", {}).get("warnings", [])
             )
-        configured_agent = effective.get("agent")
-        configured_model = effective.get("model")
-        configured_effort = effective.get("effort")
-        if configured_agent not in {"inherit", "unconfigured"} and actual_agent != configured_agent:
-            raise DevflowError("Фактический agent не совпадает с конфигурацией; silent fallback запрещён")
-        if configured_model not in {"inherit", "unconfigured"} and actual_model != configured_model:
-            raise DevflowError("Фактическая model не совпадает с конфигурацией; silent fallback запрещён")
-        if configured_effort not in {"inherit", "unconfigured"} and actual_effort != configured_effort:
-            raise DevflowError("Фактический effort не совпадает с конфигурацией; silent fallback запрещён")
+            raise DevflowError(
+                f"PASS запрещён: operate preflight вернул {preflight['status']}: "
+                + ("; ".join(str(item) for item in reasons) or "причина не сообщена адаптером preflight")
+            )
+        resolution = effective.get("resolution", {})
+        observed = {"agent": actual_agent, "model": actual_model, "effort": actual_effort}
+        for field in ("agent", "model", "effort"):
+            entry = resolution.get(field, {"mode": MODE_UNSET})
+            mode = entry.get("mode")
+            actual_value = observed[field]
+            if mode == MODE_NOT_APPLICABLE:
+                if actual_value:
+                    raise DevflowError(
+                        f"Для роли {effective['role']} параметр {field} неприменим; "
+                        "фиктивное исполняемое значение записывать нельзя"
+                    )
+            elif mode == MODE_EXPLICIT:
+                if actual_value != entry.get("value"):
+                    raise DevflowError(
+                        f"Фактический {field} не совпадает с явной конфигурацией; silent fallback запрещён"
+                    )
+            elif mode == MODE_INHERITED:
+                if not actual_value:
+                    raise DevflowError(
+                        f"Параметр {field} наследуется: PASS требует зафиксировать фактически использованное значение"
+                    )
+            elif not actual_value:
+                raise DevflowError(
+                    f"Параметр {field} намеренно не задан (mode={MODE_UNSET}): "
+                    "PASS требует записать фактически использованное значение, но оно не подставляется в конфигурацию"
+                )
     identifier = run_id(node)
     record = {
         "schema_version": 1,
@@ -2802,10 +3855,25 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
         "issue": issue,
         "pr": pr,
         "head_sha": head_sha,
-        "configured": {"role": effective["role"], "agent": effective["agent"], "model": effective["model"], "effort": effective["effort"], "skills": effective["skills"]},
+        "configured": {
+            "role": effective["role"],
+            "agent": effective["agent"],
+            "model": effective["model"],
+            "effort": effective["effort"],
+            "skills": effective["skills"],
+            "modes": {
+                field: effective.get("resolution", {}).get(field, {}).get("mode")
+                for field in PROFILE_FIELDS
+            },
+            "sources": {
+                field: effective.get("resolution", {}).get(field, {}).get("source", {}).get("pointer")
+                for field in PROFILE_FIELDS
+            },
+        },
         "actual": {"agent": actual_agent, "model": actual_model, "effort": actual_effort},
         "evidence": evidence,
         "evidence_by_name": evidence_by_name,
+        "checks": check_results,
         "verification_level": (
             "local-head-and-preflight-verified; artifact references recorded, remote artifacts remain enforced by their adapters"
             if status == "PASS" and stage in {"implementation", "verification", "review", "release"}
@@ -2828,6 +3896,7 @@ VibeCode Control настраивает и проверяет управляем
 """,
     "modes": """
 Режимы:
+- `install` — установка самого скилла пользователю Codex и/или Claude; тема справки `install`.
 - `inspect` — только чтение; стек, Git, документы, CI, тесты, скиллы и риски.
 - `init` — установка VibeCode Control в новый репозиторий.
 - `adopt` — безопасное подключение существующего проекта без массового переписывания.
@@ -2851,13 +3920,32 @@ Setup-этапы не равны этапам продукта. Подсказк
 """,
     "configuration": """
 Настройка следующих запусков:
+- `devflow config effective` — матрица «узел → этап → владелец → agent → model → effort» с режимом и источником каждой ячейки
 - `devflow config show --effective`
+- `devflow config normalize` затем `--apply` — миграция нетипизированных model/effort установленного проекта
 - `devflow role set implementer claude-code`
-- `devflow model set reviewer <model> --effort xhigh`
+- `devflow model set reviewer inherit --effort unset`
 - `devflow permissions set merge merge-verified-sha`
 - `devflow config set quality.baseline_status measured`
 
-Смена значения не переключает уже выполняющуюся модель. Если доступность модели или effort не проверена, VibeCode Control показывает PARTIAL/BLOCKED и не выбирает fallback молча.
+Каждый параметр model и effort имеет режим:
+- `explicit` — значение выбрано явно и записано;
+- `inherited` — значение определяет клиент во время запуска; его нужно наблюдать и зафиксировать, а не придумывать;
+- `unset` — параметр намеренно отсутствует и никогда не материализуется в конкретное значение;
+- `not-applicable` — роль не исполняет модель (например, `human-pm`), фиктивное значение записывать нельзя.
+
+Перед межклиентским переносом посмотрите матрицу; после записи VibeCode Control перечитывает её из фактических файлов и сравнивает ячейка в ячейку. Несовпадение блокирует запись и verify, fallback не подставляется.
+
+Смена значения не переключает уже выполняющуюся модель. Если доступность модели не проверена, VibeCode Control показывает PARTIAL/BLOCKED и не выбирает fallback молча.
+""",
+    "install": """
+Установка скилла пользователю:
+- `devflow install` — dry-run для обоих клиентов
+- `devflow install --apply` — установить и обновить копии для Codex и Claude
+- `devflow install --client claude --apply`
+- `devflow install --client codex --apply`
+
+Каталоги: Codex — `~/.agents/skills/vibecode-control`, Claude — `~/.claude/skills/vibecode-control`. Команда пишет только внутрь каталога скиллов выбранного клиента, удаляет устаревшие файлы прежней установки и проверяет контрольную сумму установленной копии против источника. Чужой скилл по этому пути не перезаписывается без `--force`.
 """,
     "skills": """
 Для каждого узла требуется одно явное решение: назначить проверенный закреплённый скилл, выбрать `zero-skill` с причиной или оставить узел BLOCKED до оценки.
@@ -2985,6 +4073,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     graph = sub.add_parser("graph", help="Generate graph from the state machine")
     graph.add_argument("--format", choices=["mermaid", "json", "table"], default="mermaid")
+    graph.add_argument("--migrate", action="store_true", help="Add missing review-artifact contracts to an older graph")
+    graph.add_argument("--apply", action="store_true", help="Apply the graph migration")
+    graph.add_argument("--full-diff", action="store_true")
 
     config = sub.add_parser("config", help="Project configuration")
     config_sub = config.add_subparsers(dest="config_command", required=True)
@@ -2993,6 +4084,11 @@ def build_parser() -> argparse.ArgumentParser:
     config_set = config_sub.add_parser("set")
     config_set.add_argument("path")
     config_set.add_argument("value")
+    config_effective = config_sub.add_parser("effective", help="Effective configuration matrix with provenance")
+    config_effective.add_argument("--format", choices=["table", "json"], default="table")
+    config_normalize = config_sub.add_parser("normalize", help="Rewrite untyped model/effort into the typed contract")
+    config_normalize.add_argument("--apply", action="store_true")
+    config_normalize.add_argument("--full-diff", action="store_true")
 
     role = sub.add_parser("role", help="Logical role assignment")
     role_sub = role.add_subparsers(dest="role_command", required=True)
@@ -3066,6 +4162,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("area", choices=["git", "code", "quality", "ci", "docs", "security", "skills", "all"])
     audit.add_argument("--deep", action="store_true")
 
+    install = sub.add_parser("install", help="Install or update this skill for Codex and Claude")
+    install.add_argument("--client", choices=["codex", "claude", "both"], default="both")
+    install.add_argument("--apply", action="store_true")
+    install.add_argument("--home", type=Path, help="Override the home directory (testing and non-standard setups)")
+    install.add_argument("--force", action="store_true", help="Replace an unrelated directory at the target path")
+
     operate = sub.add_parser("operate", help="Preflight one configured workflow node")
     operate.add_argument("--node", required=True)
 
@@ -3081,6 +4183,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_record.add_argument("--actual-agent")
     run_record.add_argument("--actual-model")
     run_record.add_argument("--actual-effort")
+    run_record.add_argument(
+        "--check",
+        action="append",
+        default=[],
+        metavar="NAME=CONCLUSION",
+        help="Observed check conclusion; only success proves a check",
+    )
     run_show = run_sub.add_parser("show")
     run_show.add_argument("run_id", nargs="?")
     return parser
@@ -3202,6 +4311,10 @@ def execute(args: argparse.Namespace) -> int:
         else:
             print_json({"stages": results, "next": next_setup_step(results, repo)})
         return 1 if next_setup_step(results, repo)["status"] == "BLOCKED" else 0
+    if args.command == "graph" and args.migrate:
+        result = migrate_graph_contracts(repo, apply=args.apply, full_diff=args.full_diff)
+        print_json(result)
+        return 0 if result["status"] in {"PASS", "NOT_APPLICABLE"} else 1
     if args.command == "graph":
         config, workflow, lock, configuration_status = load_project_or_proposed_state(repo)
         config_errors, _ = validate_config(config)
@@ -3224,6 +4337,23 @@ def execute(args: argparse.Namespace) -> int:
         if args.config_command == "set":
             print_json(configure_value(repo, args.path, args.value))
             return 0
+        if args.config_command == "effective":
+            config, workflow, lock = load_project_state(repo)
+            config_errors, _ = validate_config(config)
+            workflow_errors, _ = validate_workflow(workflow, config)
+            if config_errors or workflow_errors:
+                print_json({"status": "BLOCKED", "errors": config_errors + workflow_errors})
+                return 1
+            matrix = effective_configuration(workflow, config, lock)
+            if args.format == "json":
+                print_json(matrix)
+            else:
+                print(render_effective_configuration(matrix, "table"))
+            return 0
+        if args.config_command == "normalize":
+            result = normalize_project_config(repo, apply=args.apply, full_diff=args.full_diff)
+            print_json(result)
+            return 0 if result["status"] in {"PASS", "NOT_APPLICABLE"} else 1
     if args.command == "role" and args.role_command == "set":
         print_json(configure_role(repo, args.role, args.agent))
         return 0
@@ -3312,13 +4442,24 @@ def execute(args: argparse.Namespace) -> int:
         result = audit_project(repo, args.area, args.deep)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
+    if args.command == "install":
+        clients = ["codex", "claude"] if args.client == "both" else [args.client]
+        reports = [install_skill(client, args.apply, args.home, args.force) for client in clients]
+        status = "BLOCKED" if any(item["status"] == "BLOCKED" for item in reports) else (
+            "PARTIAL" if any(item["status"] == "PARTIAL" for item in reports) else "PASS"
+        )
+        print_json({"status": status, "applied": bool(args.apply), "clients": reports})
+        return 0 if status == "PASS" else 1
     if args.command == "operate":
         result = operate_preflight(repo, args.node)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
     if args.command == "run":
         if args.run_command == "record":
-            print_json(record_run(repo, args.node, args.status, args.head_sha, args.issue, args.pr, args.evidence, args.actual_agent, args.actual_model, args.actual_effort))
+            print_json(record_run(
+                repo, args.node, args.status, args.head_sha, args.issue, args.pr, args.evidence,
+                args.actual_agent, args.actual_model, args.actual_effort, args.check,
+            ))
             return 0
         if args.run_command == "show":
             print_json(show_node_run(repo, args.run_id))

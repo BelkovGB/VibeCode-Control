@@ -30,10 +30,23 @@
         "required": ["agent", "model", "effort", "permissions"],
         "properties": {
           "agent": {"type": "string", "minLength": 1},
-          "model": {"type": "string", "minLength": 1},
-          "effort": {"type": "string", "minLength": 1},
+          "model": {"$ref": "#/$defs/typedParameter"},
+          "effort": {"$ref": "#/$defs/typedParameter"},
           "permissions": {"type": "string", "minLength": 1}
         }
+      }
+    },
+    "node_overrides": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "agent": {"type": "string", "minLength": 1},
+          "model": {"$ref": "#/$defs/typedParameter"},
+          "effort": {"$ref": "#/$defs/typedParameter"},
+          "permissions": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
       }
     },
     "models": {"type": "object"},
@@ -42,5 +55,31 @@
     "automation": {"type": "object"},
     "telemetry": {"type": "object"}
   },
-  "additionalProperties": true
+  "additionalProperties": true,
+  "$defs": {
+    "typedParameter": {
+      "title": "Typed execution parameter",
+      "description": "A model or effort parameter always states its mode. `unset` means the parameter is deliberately absent and must never be materialized into a concrete value. A bare string is the legacy spelling, accepted on read and normalized on write.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode", "value"],
+          "properties": {
+            "mode": {"const": "explicit"},
+            "value": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": {"enum": ["inherited", "unset", "not-applicable"]}
+          },
+          "additionalProperties": false
+        },
+        {"type": "string", "minLength": 1, "deprecated": true}
+      ]
+    }
+  }
 }

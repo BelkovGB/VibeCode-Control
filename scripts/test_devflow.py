@@ -241,12 +241,17 @@ class DevflowTestCase(unittest.TestCase):
         self.assertTrue(any("schema_version" in item for item in errors))
         self.assertTrue(any("тот же узел" in item for item in errors))
 
-    def test_inherited_models_are_reported_as_unverified(self):
+    def test_declared_inherited_and_unset_modes_are_decisions_not_warnings(self):
+        # Semantic change: a declared `inherited` or `unset` mode no longer warns.
+        # It carries no value to verify, and a permanent warning made preflight PARTIAL,
+        # which made a delivery PASS unreachable for both honest modes.  The requirement
+        # is enforced in record_run instead, where the observed value must be supplied.
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["effort"] = {"mode": "unset"}
         errors, warnings = devflow.validate_config(config)
         self.assertEqual(errors, [])
-        self.assertTrue(any("наследуется" in item for item in warnings))
+        self.assertEqual(warnings, [])
 
     def test_secret_scan_reports_path_not_value(self):
         secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz123456"
@@ -760,6 +765,497 @@ class DevflowTestCase(unittest.TestCase):
         encoded = json.dumps(summary, ensure_ascii=False)
         self.assertLess(len(encoded), 60_000)
         self.assertTrue(any(operation["diff_truncated"] for operation in summary["operations"]))
+
+    # --- typed execution configuration -------------------------------------------------
+
+    def commit_worktree(self, message="fixture"):
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run([
+            "git", "-C", str(self.repo), "-c", "user.name=VibeCode Control Test",
+            "-c", "user.email=devflow@example.invalid", "commit", "-qm", message,
+        ], check=True)
+        return subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+
+    def resolve_all_skill_decisions(self):
+        _, workflow, lock = devflow.load_project_state(self.repo)
+        devflow.initialize_skill_decisions(lock, workflow)
+        for decision in lock["node_decisions"].values():
+            decision.update({"status": "zero-skill", "assigned": [], "reason": "test", "revalidation_required": False})
+        devflow.write_project_json(self.repo, devflow.SKILLS_LOCK_PATH, lock, "skills-decision")
+
+    def prepare_verified_delivery_state(self, required_checks=("unit",)):
+        """Bring a freshly installed project to a state where a delivery PASS is reachable."""
+        config, _, _ = devflow.load_project_state(self.repo)
+        for settings in config["roles"].values():
+            if settings["agent"] == "human":
+                continue
+            settings["model"] = {"mode": "explicit", "value": "verified-model"}
+        config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["verified-model"]}
+        config["automation"]["background_workers"] = "verified"
+        config["github"]["remote_settings"] = "verified"
+        config["github"]["ruleset_verified"] = True
+        config["github"]["required_checks"] = list(required_checks)
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        self.resolve_all_skill_decisions()
+        return config
+
+    def test_unset_effort_is_never_materialized_into_a_concrete_value(self):
+        self.apply_init()
+        config, workflow, lock = devflow.load_project_state(self.repo)
+        config["roles"]["reviewer"]["effort"] = {"mode": "unset"}
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        config, workflow, lock = devflow.load_project_state(self.repo)
+        node = next(item for item in workflow["nodes"] if item["id"] == "final_review")
+        effective = devflow.effective_node(node, config, lock)
+        self.assertEqual(effective["resolution"]["effort"]["mode"], "unset")
+        self.assertIsNone(effective["resolution"]["effort"].get("value"))
+        self.assertEqual(effective["effort"], "unset")
+        self.assertNotIn(effective["effort"], {"high", "xhigh", "medium", "inherit"})
+
+    def test_explicit_mode_requires_a_value_and_other_modes_forbid_one(self):
+        missing, errors = devflow.parse_profile_value({"mode": "explicit"}, "roles.qa.model")
+        self.assertEqual(missing["mode"], "unset")
+        self.assertTrue(any("value" in item for item in errors))
+        _, mixed = devflow.parse_profile_value({"mode": "unset", "value": "high"}, "roles.qa.effort")
+        self.assertTrue(any("не должно материализоваться" in item for item in mixed))
+        _, unknown = devflow.parse_profile_value({"mode": "medium"}, "roles.qa.effort")
+        self.assertTrue(any("mode" in item for item in unknown))
+
+    def test_legacy_scalar_config_normalizes_deterministically_and_idempotently(self):
+        self.apply_init()
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["roles"]["qa"]["model"] = "inherit"
+        config["roles"]["qa"]["effort"] = "high"
+        config["roles"]["human-pm"]["model"] = "not-applicable"
+        (self.repo / devflow.CONFIG_PATH).write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        self.assertIn("roles.qa.model", devflow.config_uses_legacy_profile(config))
+        dry_run = devflow.normalize_project_config(self.repo)
+        self.assertEqual(dry_run["status"], "PARTIAL")
+        self.assertFalse(dry_run["applied"])
+        applied = devflow.normalize_project_config(self.repo, apply=True)
+        self.assertEqual(applied["status"], "PASS")
+        normalized = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(normalized["roles"]["qa"]["model"], {"mode": "inherited"})
+        self.assertEqual(normalized["roles"]["qa"]["effort"], {"mode": "explicit", "value": "high"})
+        self.assertEqual(normalized["roles"]["human-pm"]["model"], {"mode": "not-applicable"})
+        self.assertEqual(devflow.normalize_project_config(self.repo)["status"], "NOT_APPLICABLE")
+
+    def test_role_without_an_executing_agent_cannot_carry_a_model(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["roles"]["human-pm"]["model"] = {"mode": "explicit", "value": "some-model"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("не исполняет модель" in item for item in errors))
+        config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["effort"] = {"mode": "not-applicable"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("недопустим для исполняющего агента" in item for item in errors))
+
+    def test_missing_typed_parameter_is_an_error_not_a_silent_default(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        del config["roles"]["qa"]["effort"]
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any('"mode": "unset"' in item for item in errors))
+
+    def test_effective_configuration_reports_mode_and_source_for_every_cell(self):
+        self.apply_init()
+        config, workflow, lock = devflow.load_project_state(self.repo)
+        config.setdefault("node_overrides", {})["final_review"] = {"effort": {"mode": "explicit", "value": "max"}}
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        matrix = devflow.effective_configuration_from_files(self.repo)
+        rows = {row["node"]: row for row in matrix["rows"]}
+        self.assertEqual(rows["final_review"]["effort"], "max")
+        self.assertEqual(rows["final_review"]["effort_mode"], "explicit")
+        self.assertEqual(rows["final_review"]["effort_source"], "node_overrides.final_review.effort")
+        self.assertEqual(rows["final_review"]["effort_source_level"], "node-override")
+        self.assertEqual(rows["final_review"]["model_source"], "roles.reviewer.model")
+        self.assertEqual(rows["final_review"]["model_source_file"], devflow.CONFIG_PATH)
+        self.assertEqual(rows["human_needed"]["model_mode"], "not-applicable")
+        self.assertFalse(rows["human_needed"]["executes_model"])
+        rendered = devflow.render_effective_configuration(matrix, "table")
+        self.assertIn("| Узел | Этап | Владелец |", rendered)
+        self.assertIn("node_overrides.final_review.effort", rendered)
+
+    def test_effective_configuration_mismatch_blocks_the_write(self):
+        self.apply_init()
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["policy"]["max_fix_cycles"] = 3
+        plan = devflow.one_file_plan(self.repo, devflow.CONFIG_PATH, devflow.json_bytes(config), "config-set")
+        self.assertTrue(plan["operations"])
+        # The approved plan promises an effort the written files will not contain.
+        plan["effective_configuration"]["rows"][0]["effort"] = "tampered"
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.apply_plan(self.repo, plan)
+        self.assertIn("не совпала с утверждённым планом", str(context.exception))
+        self.assertEqual(devflow.load_json(self.repo / devflow.CONFIG_PATH)["policy"]["max_fix_cycles"], 2)
+
+    def test_verify_reports_effective_configuration_drift_after_apply(self):
+        result = self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["roles"]["qa"]["effort"] = {"mode": "explicit", "value": "low"}
+        (self.repo / devflow.CONFIG_PATH).write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        verified = devflow.verify_run(self.repo, result["run_id"], result["manifest_sha256"])
+        self.assertEqual(verified["status"], "BLOCKED")
+        self.assertTrue(any("effort" in item for item in verified["effective_configuration_drift"]))
+
+    # --- cross-client transfer ---------------------------------------------------------
+
+    def test_codex_to_claude_transfer_keeps_modes_and_rewrites_managed_instructions(self):
+        self.apply_init()
+        for role in ["product-lead", "researcher", "architect", "reviewer", "qa", "release-operator"]:
+            devflow.configure_role(self.repo, role, "claude-code")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "transfer"))
+        matrix = devflow.effective_configuration_from_files(self.repo)
+        agents = {row["agent"] for row in matrix["rows"]}
+        self.assertNotIn("codex", agents)
+        self.assertEqual({row["model_mode"] for row in matrix["rows"] if row["executes_model"]}, {"inherited"})
+        block = (self.repo / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("`release-operator`", block)
+        self.assertIn("merge only the exact verified head SHA", block)
+        self.assertNotIn("Act only as the implementer", block)
+        self.assertNotIn("Do not merge the PR", block)
+
+    def test_claude_to_codex_transfer_removes_claimed_claude_authority(self):
+        self.apply_init()
+        devflow.configure_role(self.repo, "implementer", "codex")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "transfer-back"))
+        block = (self.repo / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("No workflow role in this project is assigned", block)
+        self.assertNotIn("As `implementer`", block)
+
+    def test_managed_block_drift_is_reported_without_rewriting_it(self):
+        self.apply_init()
+        report = devflow.managed_block_report(self.repo)
+        self.assertEqual(report["status"], "PASS")
+        devflow.configure_role(self.repo, "reviewer", "claude-code")
+        stale = devflow.managed_block_report(self.repo)
+        self.assertEqual(stale["status"], "PARTIAL")
+        self.assertTrue(any(item["path"] == "CLAUDE.md" for item in stale["details"]))
+        (self.repo / "CLAUDE.md").write_text("no markers here\n", encoding="utf-8")
+        broken = devflow.managed_block_report(self.repo)
+        self.assertEqual(broken["status"], "BLOCKED")
+
+    # --- review artifacts and check conclusions ----------------------------------------
+
+    def test_review_node_without_a_required_artifact_warns_instead_of_bricking_the_project(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        workflow = devflow.load_json(kit / "workflow.json")
+        for node in workflow["nodes"]:
+            node.pop("evidence_contract", None)
+        errors, warnings = devflow.validate_workflow(workflow, config)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("не требует ни одного обязательного артефакта" in item for item in warnings))
+
+    def test_project_installed_before_the_contract_can_still_upgrade_and_migrate(self):
+        self.apply_init()
+        workflow = devflow.load_json(self.repo / devflow.WORKFLOW_PATH)
+        for node in workflow["nodes"]:
+            node.pop("evidence_contract", None)
+        (self.repo / devflow.WORKFLOW_PATH).write_text(json.dumps(workflow, ensure_ascii=False), encoding="utf-8")
+        # The graph stays valid, so the project is not dead-ended by the new rule.
+        graph_check = next(
+            item for item in devflow.doctor(self.repo)["diagnosis"]
+            if isinstance(item, dict) and item.get("check") == "graph"
+        )
+        self.assertEqual(graph_check["status"], "PARTIAL")
+        self.assertEqual(graph_check["errors"], [])
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "still-upgradable"))
+        dry_run = devflow.migrate_graph_contracts(self.repo)
+        self.assertEqual(dry_run["status"], "PARTIAL")
+        self.assertEqual(sorted(dry_run["migrated"]), ["final_review", "implementer_review"])
+        applied = devflow.migrate_graph_contracts(self.repo, apply=True)
+        self.assertEqual(applied["status"], "PASS")
+        migrated = devflow.load_json(self.repo / devflow.WORKFLOW_PATH)
+        contract = next(node for node in migrated["nodes"] if node["id"] == "final_review")["evidence_contract"]
+        self.assertEqual(contract["review verdict bound to head SHA"]["kind"], "review")
+        self.assertEqual(devflow.migrate_graph_contracts(self.repo)["status"], "NOT_APPLICABLE")
+
+    def test_review_node_without_a_contract_cannot_record_pass(self):
+        self.apply_init()
+        workflow = devflow.load_json(self.repo / devflow.WORKFLOW_PATH)
+        for node in workflow["nodes"]:
+            node.pop("evidence_contract", None)
+        (self.repo / devflow.WORKFLOW_PATH).write_text(json.dumps(workflow, ensure_ascii=False), encoding="utf-8")
+        self.prepare_verified_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
+                ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
+                 "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
+                "codex", "verified-model", "xhigh", ["unit=success"],
+            )
+        self.assertIn("graph --migrate", str(context.exception))
+
+    def test_node_override_cannot_pair_an_executing_agent_with_not_applicable(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        workflow = devflow.load_json(kit / "workflow.json")
+        config["node_overrides"] = {"implement": {"model": {"mode": "not-applicable"}}}
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertTrue(any("исполняет модель" in item and "implement" in item for item in errors))
+        config["node_overrides"] = {"human_needed": {"model": {"mode": "explicit", "value": "some-model"}}}
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertTrue(any("не исполняет модель" in item and "human_needed" in item for item in errors))
+
+    def test_managed_block_follows_a_node_override_to_another_client(self):
+        self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config.setdefault("node_overrides", {})["final_review"] = {"agent": "claude-code"}
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "override"))
+        block = (self.repo / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("final_review", block)
+        self.assertIn("`reviewer`", block)
+        self.assertEqual(devflow.managed_block_report(self.repo)["status"], "PASS")
+
+    def test_role_set_refuses_to_write_a_configuration_it_would_invalidate(self):
+        self.apply_init()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.configure_role(self.repo, "implementer", "human")
+        self.assertIn("невалидна", str(context.exception))
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(config["roles"]["implementer"]["agent"], "claude-code")
+
+    def test_unrelated_run_stays_verifiable_after_a_later_configuration_change(self):
+        self.apply_init()
+        self.resolve_all_skill_decisions()
+        marked = devflow.mark_setup_stage(self.repo, "pilot", "PARTIAL", ["pending"], "note")
+        devflow.configure_model(self.repo, "qa", "inherit", "low")
+        verified = devflow.verify_run(self.repo, marked["run_id"], marked["manifest_sha256"])
+        self.assertEqual(verified["status"], "PASS")
+        self.assertEqual(verified["effective_configuration_drift"], [])
+
+    def test_artifact_contract_must_name_a_declared_evidence_and_known_kind(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        workflow = devflow.load_json(kit / "workflow.json")
+        for node in workflow["nodes"]:
+            if node["id"] == "final_review":
+                node["evidence_contract"] = {"not declared": {"kind": "screenshot"}}
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertTrue(any("не объявлен в expected_evidence" in item for item in errors))
+        self.assertTrue(any("вид артефакта" in item for item in errors))
+
+    def test_node_level_model_is_rejected_instead_of_being_silently_ignored(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        workflow = devflow.load_json(kit / "workflow.json")
+        workflow["nodes"][0]["model"] = "gpt-5"
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertTrue(any("молча игнорировалось бы" in item for item in errors))
+
+    def test_successful_review_job_without_its_artifact_cannot_pass(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
+                ["review verdict bound to head SHA=https://example.invalid/pr/1",
+                 "closed blocking threads=none"],
+                "codex", "verified-model", "xhigh", ["unit=success"],
+            )
+        self.assertIn("review:", str(context.exception))
+
+    def test_review_artifact_of_the_declared_kind_completes_the_gate(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state()
+        head = self.commit_worktree()
+        recorded = devflow.record_run(
+            self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
+            ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
+             "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
+            "codex", "verified-model", "xhigh", ["unit=success"],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["checks"], {"unit": "success"})
+        self.assertEqual(stored["configured"]["modes"]["model"], "explicit")
+        self.assertEqual(stored["configured"]["sources"]["effort"], "roles.reviewer.effort")
+
+    def test_red_node_passes_with_required_checks_configured_and_no_check_claims(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(required_checks=("tests",))
+        head = self.commit_worktree()
+        recorded = devflow.record_run(
+            self.repo, "tdd_red", "PASS", head, "ISSUE-1", "PR-1",
+            ["failing test before implementation=ci://run/1", "failure reason=assert 1 == 2"],
+            "claude-code", "verified-model", "high", [],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+
+    def test_red_node_records_a_failing_check_as_evidence_without_blocking(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(required_checks=("tests",))
+        head = self.commit_worktree()
+        recorded = devflow.record_run(
+            self.repo, "tdd_red", "PASS", head, "ISSUE-1", "PR-1",
+            ["failing test before implementation=ci://run/1", "failure reason=assert 1 == 2"],
+            "claude-code", "verified-model", "high", ["tests=failure"],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["checks"], {"tests": "failure"})
+
+    def prepare_honest_delivery_state(self, required_checks=("tests",)):
+        """A project that declares inherited/unset modes instead of pinning a model."""
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["roles"]["implementer"]["model"] = {"mode": "inherited"}
+        config["roles"]["implementer"]["effort"] = {"mode": "unset"}
+        config["automation"]["background_workers"] = "verified"
+        config["github"]["remote_settings"] = "verified"
+        config["github"]["ruleset_verified"] = True
+        config["github"]["required_checks"] = list(required_checks)
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        self.resolve_all_skill_decisions()
+
+    def test_inherited_and_unset_modes_reach_a_delivery_pass_with_observed_values(self):
+        self.apply_init()
+        self.prepare_honest_delivery_state()
+        head = self.commit_worktree()
+        self.assertEqual(devflow.operate_preflight(self.repo, "implement")["status"], "PASS")
+        recorded = devflow.record_run(
+            self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+            ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+             "updated architecture docs when required=n/a"],
+            "claude-code", "claude-opus-5", "high", ["tests=success"],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["configured"]["modes"]["model"], "inherited")
+        self.assertEqual(stored["configured"]["modes"]["effort"], "unset")
+        self.assertEqual(stored["actual"], {"agent": "claude-code", "model": "claude-opus-5", "effort": "high"})
+
+    def test_inherited_mode_still_requires_the_observed_value(self):
+        self.apply_init()
+        self.prepare_honest_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+                ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+                 "updated architecture docs when required=n/a"],
+                "claude-code", None, "high", ["tests=success"],
+            )
+        self.assertIn("наследуется", str(context.exception))
+
+    def test_blocked_preflight_names_its_reason(self):
+        self.apply_init()
+        self.prepare_honest_delivery_state()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["automation"]["background_workers"] = "unverified"
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+                ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+                 "updated architecture docs when required=n/a"],
+                "claude-code", "claude-opus-5", "high", ["tests=success"],
+            )
+        message = str(context.exception)
+        self.assertNotIn("preflight вернул PARTIAL: причина не сообщена", message)
+        self.assertIn("Background executor", message)
+
+    def test_green_skipped_conclusion_is_not_a_passed_check(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
+                ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
+                 "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
+                "codex", "verified-model", "xhigh", ["unit=skipped"],
+            )
+        self.assertIn("skipped", str(context.exception))
+
+    def test_required_check_without_a_reported_conclusion_blocks_pass(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
+                ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
+                 "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
+                "codex", "verified-model", "xhigh", [],
+            )
+        self.assertIn("conclusion=success", str(context.exception))
+
+    def test_post_merge_evidence_cannot_reference_a_closed_pull_request_merge_ref(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "post_merge", "PASS", head, "ISSUE-1", "PR-1",
+                ["post-merge result=ci://refs/pull/7/merge",
+                 "release identifier when applicable=n/a"],
+                "codex", "verified-model", "high", ["unit=success"],
+            )
+        self.assertIn("refs/pull", str(context.exception))
+
+    def test_not_applicable_role_rejects_a_fabricated_executable_value(self):
+        self.apply_init()
+        config, workflow, lock = devflow.load_project_state(self.repo)
+        node = next(item for item in workflow["nodes"] if item["id"] == "human_needed")
+        effective = devflow.effective_node(node, config, lock)
+        self.assertEqual(effective["resolution"]["model"]["mode"], "not-applicable")
+        self.assertEqual(effective["model"], "not-applicable")
+        self.assertIsNone(effective["resolution"]["effort"].get("value"))
+
+    def test_self_modification_of_the_control_plane_is_reported(self):
+        self.apply_init()
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "-B", "main"], check=True)
+        self.commit_worktree("baseline")
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "-b", "agent/change"], check=True)
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["project"]["decision_ref"] = "PM-7"
+        (self.repo / devflow.CONFIG_PATH).write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        self.commit_worktree("touch control plane")
+        report = devflow.guarded_control_plane_changes(self.repo)
+        self.assertTrue(report["self_modifying"])
+        self.assertIn(devflow.CONFIG_PATH, report["guarded_paths"])
+
+    # --- personal skill install --------------------------------------------------------
+
+    def test_personal_skill_installs_for_both_clients_and_verifies_its_checksum(self):
+        home = self.repo / "home"
+        dry_run = devflow.install_skill("claude", apply=False, home=home)
+        self.assertFalse(dry_run["applied"])
+        self.assertTrue(dry_run["create"])
+        self.assertEqual(dry_run["target"], str(home / ".claude" / "skills" / "vibecode-control"))
+        for client, expected in [("claude", ".claude"), ("codex", ".agents")]:
+            applied = devflow.install_skill(client, apply=True, home=home)
+            self.assertEqual(applied["status"], "PASS")
+            self.assertEqual(applied["source_checksum"], applied["installed_checksum"])
+            installed = home / expected / "skills" / "vibecode-control"
+            self.assertTrue((installed / "SKILL.md").is_file())
+            self.assertTrue((installed / "scripts" / "devflow.py").is_file())
+            self.assertTrue((installed / "assets" / "project-kit" / "config.json").is_file())
+            self.assertFalse((installed / ".git").exists())
+        self.assertTrue(devflow.install_skill("claude", apply=False, home=home)["up_to_date"])
+
+    def test_personal_skill_install_replaces_stale_files_but_not_a_foreign_skill(self):
+        home = self.repo / "home"
+        devflow.install_skill("codex", apply=True, home=home)
+        target = home / ".agents" / "skills" / "vibecode-control"
+        (target / "stale.md").write_text("obsolete\n", encoding="utf-8")
+        self.assertIn("stale.md", devflow.install_skill("codex", apply=False, home=home)["remove"])
+        devflow.install_skill("codex", apply=True, home=home)
+        self.assertFalse((target / "stale.md").exists())
+        (target / "SKILL.md").write_text("---\nname: other-skill\n---\n", encoding="utf-8")
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.install_skill("codex", apply=True, home=home)
+        self.assertIn("--force", str(context.exception))
+        self.assertEqual(devflow.install_skill("codex", apply=True, home=home, force=True)["status"], "PASS")
 
 
 if __name__ == "__main__":
