@@ -105,6 +105,8 @@ Use `setup mark` only for evidence that cannot be derived locally, such as a com
 
 Do not use `PASS` for “looks plausible,” “file exists,” or “agent said done.”
 
+Preparing the GitHub side of a repository — rulesets, required checks, Actions policy, secrets and merge policy — is a step-by-step runbook of its own: [github-preparation.md](github-preparation.md). It gives each setting a verify command and states what VibeCode Control reports without it.
+
 ## Command map
 
 ```text
