@@ -8,6 +8,7 @@ Rule precedence: latest explicit PM decision; current repository sources of trut
 For delivery work:
 
 - Use one ready Issue, one branch, and one PR.
+- Size an Issue around one feature or decision. Group several small features only when they live in one place and the PR still reviews in a single pass, and add an incidental fix to the active Issue by updating its scope explicitly, never silently.
 - Default to one active implementation PR. Use parallel streams only when project configuration explicitly allows them; serialize migrations, shared central files, production data, and trust-gate work.
 - Keep scope and priorities unchanged unless the PM approves a product change.
 - Classify task risk and map each acceptance criterion to a check and evidence.

@@ -54,6 +54,16 @@ An Issue is ready only if it contains:
 
 Use one Issue, one branch, and one PR. Use `Closes #N` only for complete delivery and `Related to #N` for an explicitly accepted partial split.
 
+Size an Issue around one feature or one decision. Decompose larger work until each part is ready on its own; a piece that cannot reach Definition of Ready without carrying several unrelated decisions is not one Issue.
+
+Several small related features may share one Issue only when they live in the same place — one file or one module — and the resulting PR still reviews in a single pass.
+
+A small incidental fix in a module already being changed belongs in the active Issue, added by explicitly updating its scope rather than silently. Anything the active scope does not cover goes back to the backlog.
+
+Do not mix a change to a guarded or central file with feature work unless the feature genuinely requires it: a guarded change deserves its own review attention.
+
+The boundary is qualitative and has no invented threshold. When a PR stops being reviewable in one pass — a reviewer cannot hold its scope, evidence, and risk at once — the work needed decomposition earlier, and the next Issue must be split.
+
 Default to one active implementation PR. Enable two independent streams only through an explicit project decision and configuration. When parallel work is enabled:
 
 - keep at most one implementation PR in each stream;

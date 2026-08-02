@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <code>v0.1.0</code> · проекты на любом стеке · CLI: Python 3.10+ · 102 автотеста
+  <code>v0.1.0</code> · проекты на любом стеке · CLI: Python 3.10+ · 105 автотестов
 </p>
 
 <p align="center">
@@ -546,7 +546,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 python3 scripts/devflow.py --version
 ```
 
-Текущий набор содержит 102 автоматических теста: установка и обновление, граф, rollback, checksum drift, повреждённая конфигурация, опасные сторонние скиллы, delivery evidence, remote-gate preflight, типизированные model и effort, матрица эффективной конфигурации, миграция `config normalize` и `graph --migrate`, гейт review-артефактов, нейтральность публичного шаблона и установка пользовательского скилла.
+Текущий набор содержит 105 автоматических тестов: установка и обновление, граф, rollback, checksum drift, повреждённая конфигурация, опасные сторонние скиллы, delivery evidence, remote-gate preflight, типизированные model и effort, матрица эффективной конфигурации, миграция `config normalize` и `graph --migrate`, гейт review-артефактов, нейтральность публичного шаблона, правило декомпозиции задач и установка пользовательского скилла.
 
 В Windows задайте `PYTHONUTF8=1` перед запуском тестов (`$env:PYTHONUTF8 = "1"`). Два теста проверяют symlink и требуют режима разработчика или прав администратора.
 

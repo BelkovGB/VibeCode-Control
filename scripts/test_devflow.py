@@ -1288,6 +1288,34 @@ class DevflowTestCase(unittest.TestCase):
 
     # --- neutral public template ------------------------------------------------------
 
+    def test_prepare_issue_node_requires_a_single_feature_scope(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        workflow = devflow.load_json(kit / "workflow.json")
+        node = next(item for item in workflow["nodes"] if item["id"] == "prepare_issue")
+        self.assertTrue(any("one feature" in check for check in node["checks"]))
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertEqual(errors, [])
+
+    def test_decomposition_rule_is_canonical_in_process_and_managed_material(self):
+        root = Path(devflow.__file__).resolve().parent.parent
+        reference = (root / "references" / "process-and-quality.md").read_text(encoding="utf-8")
+        self.assertIn("Size an Issue around one feature or one decision", reference)
+        self.assertIn("reviewable in one pass", reference)
+        block = (devflow.find_project_kit(self.repo) / "managed" / "AGENTS.block.md").read_text(encoding="utf-8")
+        self.assertIn("Size an Issue around one feature or decision", block)
+        self.assertIn(devflow.MANAGED_START, block)
+
+    def test_pending_decision_hint_offers_every_typed_mode(self):
+        self.apply_init()
+        pending = devflow.pending_execution_decisions(
+            devflow.load_json(self.repo / devflow.CONFIG_PATH),
+            devflow.load_json(self.repo / devflow.WORKFLOW_PATH),
+        )
+        model_hint = next(item for item in pending if item["pointer"].endswith(".model"))
+        for mode in ["inherit", "unset", "not-applicable"]:
+            self.assertIn(mode, model_hint["command"])
+
     def test_shipped_kit_names_no_executor_model_or_effort(self):
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")
