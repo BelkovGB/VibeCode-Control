@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "devflow_version": "0.1.0",
+  "project": {
+    "name": "__AUTO__",
+    "mode": "unconfigured",
+    "product_stage": "unassessed",
+    "decision_ref": "",
+    "repository_type": "auto"
+  },
+  "policy": {
+    "language": "ru",
+    "rule_precedence": [
+      "latest_explicit_pm_decision",
+      "current_repository_sources_of_truth",
+      "project_devflow_config",
+      "devflow_defaults"
+    ],
+    "require_dry_run": true,
+    "max_fix_cycles": 2,
+    "max_parallel_implementation_prs": 1,
+    "stacked_prs_allowed": false,
+    "serialize_high_collision_changes": true,
+    "allow_paid_fallback": false,
+    "architecture_docs_in_same_pr": true,
+    "private_chat_links_in_repo": false
+  },
+  "roles": {
+    "human-pm": {
+      "agent": "human",
+      "model": "not-applicable",
+      "effort": "not-applicable",
+      "permissions": "human-approval"
+    },
+    "product-lead": {
+      "agent": "codex",
+      "model": "inherit",
+      "effort": "high",
+      "permissions": "plan-and-github"
+    },
+    "researcher": {
+      "agent": "codex",
+      "model": "inherit",
+      "effort": "high",
+      "permissions": "read-and-research"
+    },
+    "architect": {
+      "agent": "codex",
+      "model": "inherit",
+      "effort": "high",
+      "permissions": "plan-and-repo-read"
+    },
+    "implementer": {
+      "agent": "claude-code",
+      "model": "inherit",
+      "effort": "high",
+      "permissions": "workspace-write-no-merge"
+    },
+    "reviewer": {
+      "agent": "codex",
+      "model": "inherit",
+      "effort": "xhigh",
+      "permissions": "review-and-github"
+    },
+    "qa": {
+      "agent": "codex",
+      "model": "inherit",
+      "effort": "high",
+      "permissions": "verify-read-only"
+    },
+    "release-operator": {
+      "agent": "codex",
+      "model": "inherit",
+      "effort": "high",
+      "permissions": "merge-verified-sha"
+    }
+  },
+  "models": {
+    "availability_checked_at": null,
+    "available": []
+  },
+  "quality": {
+    "baseline_status": "unmeasured",
+    "risk_profile": "unclassified",
+    "commands": {
+      "lint": [],
+      "typecheck": [],
+      "unit": [],
+      "integration": [],
+      "e2e": [],
+      "security": []
+    },
+    "coverage_policy": "no-regression-from-measured-baseline",
+    "mutation_policy": "critical-changed-logic-only",
+    "tdd_for_behavior_changes": true
+  },
+  "github": {
+    "remote_settings": "unverified",
+    "ruleset_verified": false,
+    "required_checks": [],
+    "codeowners_verified": false,
+    "delete_branch_on_merge": "unverified"
+  },
+  "automation": {
+    "background_workers": "unverified",
+    "notifications": "state-change-only",
+    "run_records_path": ".agent-flow/.local/node-runs",
+    "evidence_must_match_head_sha": true
+  },
+  "telemetry": {
+    "usage": "нет доступной телеметрии"
+  }
+}

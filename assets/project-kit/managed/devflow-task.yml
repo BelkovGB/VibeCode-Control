@@ -1,0 +1,79 @@
+name: VibeCode Control task
+description: Ready implementation task with risk-based acceptance evidence
+title: "[Task] "
+labels: ["devflow:ready-check"]
+body:
+  - type: markdown
+    attributes:
+      value: "The task is ready only when scope, decisions, checks, and dependencies are explicit."
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: User or system outcome, not an implementation guess.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and boundaries
+      description: State both included and explicitly excluded work.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and active-work conflicts
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk class
+      options:
+        - low
+        - medium
+        - high
+        - critical
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Each criterion must map to a check and evidence.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Required checks and evidence
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Architecture impact
+      options:
+        - none
+        - architecture changes; update canonical docs in this PR
+        - unresolved; requires architect decision before implementation
+    validations:
+      required: true
+  - type: textarea
+    id: docs
+    attributes:
+      label: Relevant canonical documents
+    validations:
+      required: true
+  - type: checkboxes
+    id: ready
+    attributes:
+      label: Definition of Ready
+      options:
+        - label: No unresolved product decision remains.
+          required: true
+        - label: The task does not conflict with active work.
+          required: true
+        - label: Required skills and execution environment are known.
+          required: true
