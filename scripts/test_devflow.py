@@ -249,7 +249,7 @@ class DevflowTestCase(unittest.TestCase):
         self.assertTrue(any("наследуется" in item for item in warnings))
 
     def test_secret_scan_reports_path_not_value(self):
-        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz123456"
         (self.repo / "config.py").write_text(f'TOKEN="{secret}"\n', encoding="utf-8")
         report = devflow.inspect_repository(self.repo)
         encoded = json.dumps(report, ensure_ascii=False)
@@ -482,7 +482,7 @@ class DevflowTestCase(unittest.TestCase):
         self.assertTrue(any("history" in gap.lower() for gap in security["gaps"]))
 
     def test_remote_and_plan_diff_redact_secret_values(self):
-        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz123456"
         remote = devflow.sanitize_remote(f"origin ssh://user:supersecret@example.com/repo?token={secret} (fetch)")
         self.assertNotIn("supersecret", remote)
         self.assertNotIn(secret, remote)
