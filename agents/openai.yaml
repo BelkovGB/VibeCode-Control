@@ -1,0 +1,14 @@
+interface:
+  display_name: VibeCode Control
+  short_description: Настройка и аудит управляемой AI-разработки
+  default_prompt: Используй $vibecode-control, чтобы проверить проект, настроить процесс разработки
+    и показать следующий шаг.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
