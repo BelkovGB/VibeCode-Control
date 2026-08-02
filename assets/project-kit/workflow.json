@@ -135,6 +135,9 @@
       "competencies": ["code review", "defect class search"],
       "inputs": ["diff", "issue", "evidence"],
       "expected_evidence": ["self-review report", "resolved findings"],
+      "evidence_contract": {
+        "self-review report": {"kind": "findings", "required": true}
+      },
       "checks": ["issue criteria rechecked"],
       "timeout_minutes": 45
     },
@@ -149,6 +152,9 @@
       "competencies": ["independent code review", "architecture", "product policy"],
       "inputs": ["PR", "issue", "current head SHA", "evidence"],
       "expected_evidence": ["review verdict bound to head SHA", "closed blocking threads"],
+      "evidence_contract": {
+        "review verdict bound to head SHA": {"kind": "review", "required": true}
+      },
       "checks": ["scope matches issue", "architecture docs current", "no unsupported claims"],
       "timeout_minutes": 90
     },

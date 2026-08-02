@@ -4,9 +4,11 @@
 
 1. Sources and precedence
 2. Project configuration
-3. State-machine contract
-4. Validation
-5. Safe changes
+3. Typed model and effort
+4. Effective configuration
+5. State-machine contract
+6. Validation
+7. Safe changes
 
 ## Sources and precedence
 
@@ -44,9 +46,78 @@ Keep logical roles independent from concrete agents:
 - `qa`;
 - `release-operator`.
 
-Record `agent`, `model`, `effort`, and `permissions` per role. Use `node_overrides` only for a justified exception. Record actual values in each run because configured and executed values may differ.
+Record `agent`, `model`, `effort`, and `permissions` per role. Use `node_overrides` only for a justified exception. Record actual values in each run because configured and executed values may differ. That comparison is mode-aware: `explicit` must match the actual value exactly, `inherited` and `unset` require the actual observed value while the configuration stays as written, and `not-applicable` rejects any actual value as fabricated.
 
-Use `inherit` when the surface should keep its active model. A model name is not verified until the actual surface reports it available. Never infer availability from documentation alone.
+A model name is not verified until the actual surface reports it available. Never infer availability from documentation alone.
+
+Workflow logic is shared between Codex and Claude. Execution configuration is not: agent identifiers, model names, effort vocabularies, and permission profiles are client-specific and must not be copied across clients without an explicit decision. Moving a stage to another client does not carry the source client's default model or effort with it.
+
+## Typed model and effort
+
+Every `model` and `effort` parameter under `roles.<role>` and `node_overrides.<node>` states its mode. `config.schema.json` defines the shape once as `$defs.typedParameter` and now also declares `node_overrides`; `schema_version` stays 1.
+
+Chosen and pinned:
+
+```json
+"model": {"mode": "explicit", "value": "<model the client reports available>"},
+"effort": {"mode": "explicit", "value": "high"}
+```
+
+Resolved by the client at run time. It must be observed and recorded during the run, never invented:
+
+```json
+"model": {"mode": "inherited"}
+```
+
+Deliberately absent. It must never be materialized into a concrete value:
+
+```json
+"effort": {"mode": "unset"}
+```
+
+The role executes no model, because its agent is `human`, `script`, or `deterministic`:
+
+```json
+"model": {"mode": "not-applicable"},
+"effort": {"mode": "not-applicable"}
+```
+
+Only `explicit` carries a `value` key. A `value` next to any other mode is an error, so nothing absent can later be mistaken for something configured.
+
+A role whose agent does not execute a model must use `not-applicable` for both `model` and `effort`; an executing agent must not use it for either. A missing `model` or `effort` key is an error, not an implicit default: write `{"mode": "unset"}` explicitly.
+
+A bare string is the legacy spelling. It is accepted on read and normalized on write:
+
+| Legacy scalar | Normalized to |
+| --- | --- |
+| A concrete value, for example `"high"` | `{"mode": "explicit", "value": "high"}` |
+| `"inherit"` | `{"mode": "inherited"}` |
+| `"not-applicable"` | `{"mode": "not-applicable"}` |
+| `"unset"` or `"unconfigured"` | `{"mode": "unset"}` |
+
+While legacy spellings remain, validation emits a warning naming the exact pointers, for example `roles.reviewer.model`. `devflow model set` takes the scalar on the command line and stores the typed form.
+
+Migrate an installed project with `devflow config normalize`. The dry run shows the plan and the diff and returns `PARTIAL` with the next command; `devflow config normalize --apply` writes the rewritten file. The rewrite is deterministic and idempotent, so a second run returns `NOT_APPLICABLE`. It returns `BLOCKED` and writes nothing if the normalized configuration would be invalid.
+
+## Effective configuration
+
+Resolve `model` and `effort` in this order: `node_overrides.<node>`, then `roles.<role>`, then absent. Resolve `permissions` in this order: `node_overrides.<node>`, then the node in `workflow.json`, then `roles.<role>`.
+
+Every resolved field reports `{value, mode, source: {level, pointer, file}}`. `level` is `node-override`, `role`, `node`, or `absent`. `pointer` is the exact key, for example `roles.reviewer.model`. `file` is `.agent-flow/config.json` or `.agent-flow/workflow.json`, and both are null when the level is `absent`.
+
+`devflow config effective [--format table|json]` renders the matrix:
+
+```
+| Узел | Этап | Владелец | Agent | Model | Model mode | Model источник | Effort | Effort mode | Effort источник |
+```
+
+Read each parameter across its three columns: the value, the mode that says how it was chosen, and the pointer that says which key chose it. A parameter with no configured value renders `—`, so for `inherited`, `unset`, and `not-applicable` the mode column carries the meaning. `--format json` returns the same rows with the `agent` and `permissions` cells included and with the source pointer, file, and level for every field.
+
+Read the matrix twice around every change. Before apply it is attached to every plan that rewrites `.agent-flow/config.json` or `.agent-flow/workflow.json`, so the reviewer approves the resolved execution profile rather than a diff of keys. A plan that leaves both of those files untouched carries no matrix, which keeps an unrelated earlier run verifiable after a later authorized configuration change. After apply the matrix is rebuilt from the files on disk and compared cell by cell with the approved plan, across stage, state, owner, agent, model, effort, their modes, and permissions.
+
+Any difference aborts the apply and rolls the write back, and `devflow verify` returns `BLOCKED` with the differences listed in `effective_configuration_drift` as `<node>.<cell>: план=…, файлы=…`. There is no fallback and no reconciliation. On that status the files no longer match what was approved: do not re-run apply and do not hand-edit a file to match the matrix. Fix the pointer named in the difference, rebuild the plan, and have it approved again.
+
+`devflow operate --node <id>` returns `effective_configuration` for the node alongside `required_artifacts` and `self_modification`.
 
 ## State-machine contract
 
@@ -69,7 +140,20 @@ Treat `.agent-flow/workflow.json` as canonical. Each node must contain:
 }
 ```
 
-Resolve `agent`, `model`, and `effort` from role assignment plus a node override. Resolve external skills from `skills.lock.json`.
+Resolve `agent`, `model`, and `effort` from `.agent-flow/config.json` only, through the role assignment and an optional node override. A `model` or `effort` key written inside a workflow node is a validation error, because it would be silently ignored. Resolve external skills from `skills.lock.json`.
+
+A node may declare `evidence_contract`, which binds a name from `expected_evidence` to the artifact that proves the node ran:
+
+```json
+"expected_evidence": ["review verdict bound to head SHA"],
+"evidence_contract": {
+  "review verdict bound to head SHA": {"kind": "review", "required": true}
+}
+```
+
+`kind` is one of `review`, `comment`, `findings`, `report`, `check-run`. Every contract key must also appear in `expected_evidence`, and `required` must be a boolean. A node in the `review` stage should declare at least one required artifact: a successful job without the artifact it was supposed to produce is not a passed check. A review-stage node without one is a validation warning, not an error — the warning names the node and states that `PASS` is forbidden for it until the graph is migrated, so a graph written before this contract stays valid and `doctor`, `upgrade`, and the migration keep working on it. The gate is enforced at record time: `devflow run record` refuses a `PASS` on a review-stage node that declares no required artifact and names the migration command. The shipped graph declares the contract for `implementer_review`, where `self-review report` is `findings`, and for `final_review`, where `review verdict bound to head SHA` is `review`.
+
+Migrate an older graph with `devflow graph --migrate`. The dry run shows the plan and the diff and returns `PARTIAL` with the next command; `devflow graph --migrate --apply` writes `.agent-flow/workflow.json` through the normal plan machinery under the `graph-migrate` plan mode, which may write that file and nothing else. The tool only migrates node IDs that also exist in the canonical shipped graph, only by copying that graph's declaration, and only when every contract key is already present in that node's `expected_evidence`. A review node this skill does not ship is never given a guessed artifact kind: it is listed under `requires_explicit_decision`, and the operator adds its `evidence_contract` to `.agent-flow/workflow.json` explicitly. A graph that already declares its contracts returns `NOT_APPLICABLE`. For a project installed before both contracts the full order is `devflow config normalize --apply`, then `devflow graph --migrate --apply`, then `devflow upgrade --apply`.
 
 Each edge must contain:
 
@@ -102,7 +186,14 @@ Block automation on:
 - an unknown failure destination;
 - an unsafe condition string;
 - a merge path without verified head SHA and green required checks;
-- a required skill unavailable to the assigned background agent.
+- a required skill unavailable to the assigned background agent;
+- a `model` or `effort` key inside a workflow node;
+- a missing `model` or `effort` key on a role, an unknown mode, or a `value` next to a non-explicit mode;
+- `not-applicable` on an executing agent, or an executable mode on `human`, `script`, or `deterministic`;
+- an evidence contract key absent from `expected_evidence`, an unknown artifact kind, or a non-boolean `required`;
+- an effective-configuration matrix rebuilt from the files that does not match the approved plan.
+
+Warn without blocking on a review-stage node that declares no required artifact. The warning names the node and states that `PASS` is forbidden for it until the graph is migrated with `devflow graph --migrate --apply`; the graph stays valid and `devflow run record` refuses the `PASS`.
 
 Generate Mermaid and tables from the validated graph. Do not store a separately edited diagram as another source of truth.
 
@@ -110,6 +201,6 @@ Generate Mermaid and tables from the validated graph. Do not store a separately 
 
 Use typed file operations only. Before apply, capture path, pre-hash, intended post-hash, diff, risk, and reversibility. Reject path traversal and writes through symlinks. Re-check every pre-hash immediately before atomic write.
 
-Keep local plans, reports, apply manifests, and rollback data in `.agent-flow/.local/`. Do not commit them. User-named outputs are create-only and confined to `.agent-flow/.local/plans/*.json` or `.agent-flow/.local/reports/*.json`. Retain the manifest SHA-256 returned by apply and require it for later verify or rollback. Then validate the mutable manifest schema, repository, run ID, mode-specific path allowlist, hashes, base64 payloads, and size. Roll back only a specific run and only if every affected file still matches its post-apply hash. Stop on drift and preserve the user’s newer work.
+Keep local plans, reports, apply manifests, and rollback data in `.agent-flow/.local/`. Do not commit them. User-named outputs are create-only and confined to `.agent-flow/.local/plans/*.json` or `.agent-flow/.local/reports/*.json`. Retain the manifest SHA-256 returned by apply and require it for later verify or rollback. Then validate the mutable manifest schema, repository, run ID, mode-specific path allowlist, hashes, base64 payloads, and size. Roll back only a specific run and only if every affected file still matches its post-apply hash. Stop on drift and preserve the user’s newer work. When the plan carries an effective-configuration matrix, apply also rebuilds it from the written files before the manifest is stored and rolls the whole run back on any difference.
 
 Use marked blocks to preserve unmanaged content in `AGENTS.md`, `CLAUDE.md`, `.gitignore`, and PR templates. Treat project config, graph, schemas, project CLI, prompts, and the core `devflow-node` skill as guarded process files requiring reinforced review when changed.

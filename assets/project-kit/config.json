@@ -28,50 +28,50 @@
   "roles": {
     "human-pm": {
       "agent": "human",
-      "model": "not-applicable",
-      "effort": "not-applicable",
+      "model": {"mode": "not-applicable"},
+      "effort": {"mode": "not-applicable"},
       "permissions": "human-approval"
     },
     "product-lead": {
       "agent": "codex",
-      "model": "inherit",
-      "effort": "high",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "high"},
       "permissions": "plan-and-github"
     },
     "researcher": {
       "agent": "codex",
-      "model": "inherit",
-      "effort": "high",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "high"},
       "permissions": "read-and-research"
     },
     "architect": {
       "agent": "codex",
-      "model": "inherit",
-      "effort": "high",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "high"},
       "permissions": "plan-and-repo-read"
     },
     "implementer": {
       "agent": "claude-code",
-      "model": "inherit",
-      "effort": "high",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "high"},
       "permissions": "workspace-write-no-merge"
     },
     "reviewer": {
       "agent": "codex",
-      "model": "inherit",
-      "effort": "xhigh",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "xhigh"},
       "permissions": "review-and-github"
     },
     "qa": {
       "agent": "codex",
-      "model": "inherit",
-      "effort": "high",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "high"},
       "permissions": "verify-read-only"
     },
     "release-operator": {
       "agent": "codex",
-      "model": "inherit",
-      "effort": "high",
+      "model": {"mode": "inherited"},
+      "effort": {"mode": "explicit", "value": "high"},
       "permissions": "merge-verified-sha"
     }
   },

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <code>v0.1.0</code> · проекты на любом стеке · CLI: Python 3.10+ · 61 автотест
+  <code>v0.1.0</code> · проекты на любом стеке · CLI: Python 3.10+ · 90 автотестов
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@ AI-агенты умеют быстро писать код, но скорост
 |---|---|
 | Агент начинает работу без понимания проекта | Инспектирует репозиторий, документы, Git, тесты, CI и риски до изменений |
 | Новый и legacy-проект подключаются одинаково | Разделяет безопасные режимы `init` и `adopt`, сначала показывает dry-run |
-| Непонятно, кто и на какой модели выполняет этап | Хранит исполняемый граф ролей, агентов, моделей, effort и разрешений |
+| Непонятно, кто и на какой модели выполняет этап | Хранит исполняемый граф ролей, агентов, моделей, effort и разрешений и показывает режим и источник каждого параметра |
 | Фоновый агент не видит нужные скиллы | Закрепляет версии, проверяет checksum и доставляет копии Codex и Claude |
 | «Готово» подтверждено только текстом модели | Требует объективные проверки и evidence, привязанные к текущему Git SHA |
 | Изменение конфигурации может повредить проект | Использует план, allowlist путей, SHA-256, атомарную запись и rollback |
@@ -50,7 +50,10 @@ AI-агенты умеют быстро писать код, но скорост
 - ведёт настройку по этапам и всегда показывает один следующий практический шаг;
 - хранит state graph разработки в `.agent-flow/workflow.json`;
 - отделяет логические роли от конкретных агентов, моделей и permission profiles;
+- хранит каждый `model` и `effort` с режимом `explicit`, `inherited`, `unset` или `not-applicable` и не подставляет значение вместо отсутствующего;
+- собирает матрицу эффективной конфигурации с источником каждого значения, прикладывает её к плану и после применения перечитывает из файлов и сверяет ячейка в ячейку;
 - требует по каждому узлу либо проверенный скилл, либо обоснованный `zero-skill`;
+- предупреждает о review-узле без объявленных обязательных артефактов, запрещает ему `PASS` при записи запуска и принимает проверку только с conclusion `success`;
 - закрепляет сторонние скиллы по commit SHA и контролирует их целостность;
 - готовит проектные копии скиллов для `.agents/skills` и `.claude/skills`;
 - проверяет Git, код, качество, CI, документацию, безопасность и skill dependencies;
@@ -129,7 +132,7 @@ python3 "$VIBECODE_CONTROL_DIR/scripts/devflow.py" --repo /path/to/my-app inspec
 
 ### Вариант 2. Установка как пользовательского скилла Codex
 
-Codex загружает пользовательские скиллы из `$HOME/.agents/skills`. Клонируйте репозиторий в отдельную папку скилла:
+Codex загружает пользовательские скиллы из `$HOME/.agents/skills`. Клонируйте репозиторий в отдельную папку скилла `vibecode-control`:
 
 Windows PowerShell:
 
@@ -150,6 +153,48 @@ $vibecode-control Проверь этот репозиторий, покажи �
 ```
 
 Codex обнаруживает изменения скиллов автоматически. Если скилл не появился, перезапустите Codex. Подробнее: [официальная документация OpenAI о скиллах](https://learn.chatgpt.com/docs/build-skills).
+
+### Вариант 3. Установка как пользовательского скилла Claude
+
+Claude загружает пользовательские скиллы из `$HOME/.claude/skills`. Отличается только каталог, всё остальное симметрично Codex:
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/BelkovGB/VibeCode-Control.git "$env:USERPROFILE\.claude\skills\vibecode-control"
+```
+
+Linux/macOS:
+
+```bash
+git clone https://github.com/BelkovGB/VibeCode-Control.git "$HOME/.claude/skills/vibecode-control"
+```
+
+В Claude скилл вызывается по имени `vibecode-control` — например, «Используй скилл vibecode-control: проверь этот репозиторий, покажи этапы настройки, граф и рекомендуемые скиллы по узлам».
+
+### Вариант 4. Установка командой `devflow install`
+
+Поддерживаемый способ поставить и обновлять обе пользовательские копии из одного клона: в отличие от ручного `git clone` команда удаляет файлы прежней версии и проверяет результат. Сначала dry-run:
+
+```bash
+python3 <vibecode-control>/scripts/devflow.py install
+```
+
+Отчёт показывает источник, целевой каталог, число файлов, общий объём в байтах, контрольную сумму источника и установленной копии, а также списки создаваемых, обновляемых и удаляемых файлов. Затем запись:
+
+```bash
+python3 <vibecode-control>/scripts/devflow.py install --apply
+python3 <vibecode-control>/scripts/devflow.py install --client claude --apply
+python3 <vibecode-control>/scripts/devflow.py install --client codex --apply
+```
+
+- `--client codex|claude|both` — какой каталог обновлять, по умолчанию `both`;
+- `--apply` — атомарная запись, удаление файлов прежней установки и повторный подсчёт контрольной суммы установленного дерева;
+- `--force` — заменить чужой или посторонний каталог по этому пути; без флага команда отказывается его трогать.
+
+Совпадение контрольных сумм доказывает, что установленная копия побайтово равна источнику и не содержит остатков прежней версии; расхождение даёт `BLOCKED`, а не молчаливую доустановку. Команда не пишет за пределы каталога скиллов выбранного клиента, отказывается работать с symlink-целью и не копирует `.git` (он же исключён из контрольной суммы).
+
+> Логика процесса общая для Codex и Claude. Конфигурация исполнения — идентификаторы агентов, имена моделей, словари effort и permission profiles — специфична для клиента и не переносится между ними без отдельного решения. Перенос этапа с одного клиента на другой не переносит модель и effort исходного клиента.
 
 ## Быстрый старт
 
@@ -231,9 +276,53 @@ python3 .agent-flow/devflow.py config show --effective
 python3 .agent-flow/devflow.py role set implementer claude-code
 python3 .agent-flow/devflow.py model set reviewer <model> --effort xhigh
 python3 .agent-flow/devflow.py permissions set merge merge-verified-sha
+python3 .agent-flow/devflow.py config effective --format table
 ```
 
-Изменения применяются к будущим запускам. Если доступность модели или effort не проверена на реальной платформе, статус останется `PARTIAL` или `BLOCKED` — скрытого fallback нет.
+Каждый `model` и `effort` в `.agent-flow/config.json` хранится с режимом:
+
+| Режим | Значение |
+|---|---|
+| `{"mode": "explicit", "value": "<model или effort>"}` | Значение выбрано и закреплено |
+| `{"mode": "inherited"}` | Значение определяет клиент во время запуска; его нужно наблюдать и записать, а не придумать |
+| `{"mode": "unset"}` | Параметр намеренно отсутствует и никогда не материализуется в конкретное значение |
+| `{"mode": "not-applicable"}` | Роль не исполняет модель: агент `human`, `script` или `deterministic` |
+
+Голая строка — legacy-запись. Она принимается при чтении и нормализуется при записи (конкретное значение → `explicit`, `inherit` → `inherited`, `not-applicable` → `not-applicable`, `unset` и `unconfigured` → `unset`), но даёт предупреждение с точным указателем параметра. Пропущенный ключ `model` или `effort` — ошибка: режим `unset` пишется явно. Роль без исполняемой модели обязана использовать `not-applicable` для обоих параметров, а роль с исполняющим агентом не имеет права его использовать.
+
+`config effective` строит матрицу `| Узел | Этап | Владелец | Agent | Model | Model mode | Model источник | Effort | Effort mode | Effort источник |`. Порядок разрешения для model и effort: `node_overrides[<узел>]` → `roles[<роль узла>]` → отсутствует; для permissions: `node_overrides[<узел>]` → узел в `workflow.json` → `roles[<роль узла>]`. Источник называет уровень (`node-override`, `role`, `node`, `absent`), указатель вида `roles.reviewer.model` и файл. Ключи `model` и `effort` на уровне узла в `workflow.json` — ошибка валидации, а не молча игнорируемое поле.
+
+Матрица прикладывается только к плану, который переписывает `.agent-flow/config.json` или `.agent-flow/workflow.json`. Так более ранний запуск остаётся проверяемым после позднейшего разрешённого изменения конфигурации. После применения она перестраивается из фактических файлов на диске и сверяется с утверждённым планом ячейка в ячейку: расхождение прерывает apply с откатом записи, а `devflow verify` возвращает `BLOCKED` со списком `effective_configuration_drift`. Fallback и автоматического согласования нет.
+
+Изменения применяются к будущим запускам. Если доступность модели или effort не проверена на реальной платформе, статус останется `PARTIAL` или `BLOCKED`. Управляемый блок инструкций Claude не фиксированный шаблон: он генерируется из установленной конфигурации и перечисляет только роли, чей агент отображается на Claude, их permission profiles и принадлежащие им узлы. Право на merge он даёт лишь тогда, когда назначена роль `release-operator`; если Claude не назначена ни одна роль, блок так и написан и не объявляет Claude исполнителем. Блоки перегенерируются в `init`, `adopt`, `upgrade` и `repair`, а `role set` allowlist записи не расширяет: после переназначения роли выполните `devflow upgrade`, иначе `devflow doctor` вернёт `PARTIAL` по проверке `managed-blocks`.
+
+#### Миграция уже установленного проекта
+
+Проект, настроенный до типизированного контракта, переводится отдельной командой:
+
+```bash
+python3 .agent-flow/devflow.py config normalize
+python3 .agent-flow/devflow.py config normalize --apply
+```
+
+Без `--apply` команда показывает план и diff. Она переписывает нетипизированные `model` и `effort` в каноническую типизированную форму, детерминирована и идемпотентна: повторный запуск возвращает `NOT_APPLICABLE`. Если результат оказался бы невалидным, команда возвращает `BLOCKED` и ничего не пишет. `schema_version` остаётся `1`.
+
+Граф, написанный до контракта артефактов review, дополняется командой `graph --migrate`:
+
+```bash
+python3 .agent-flow/devflow.py graph --migrate
+python3 .agent-flow/devflow.py graph --migrate --apply
+```
+
+Команда добавляет недостающие контракты только тем id узлов, которые есть и в каноническом поставляемом графе, только копированием его объявления и только когда каждый ключ контракта уже присутствует в `expected_evidence` этого узла. Review-узлу, которого нет в поставке, вид артефакта не угадывается: такой узел перечисляется в `requires_explicit_decision`, и оператор добавляет `evidence_contract` в `.agent-flow/workflow.json` явно. Dry-run возвращает `PARTIAL` с планом и diff; `--apply` пишет через обычную машинерию планов в новом режиме `graph-migrate`, которому разрешено записывать `.agent-flow/workflow.json` и ничего больше. Граф, где контракты уже объявлены, возвращает `NOT_APPLICABLE`.
+
+Полный порядок миграции проекта, установленного до этого изменения:
+
+```bash
+python3 .agent-flow/devflow.py config normalize --apply   # типизированные model и effort
+python3 .agent-flow/devflow.py graph --migrate --apply    # контракты артефактов review
+python3 .agent-flow/devflow.py upgrade --apply            # управляемые инструкции и project CLI
+```
 
 ### 4. Выбрать скиллы для узлов
 
@@ -252,7 +341,7 @@ python3 .agent-flow/devflow.py skills verify --node implement
 python3 .agent-flow/devflow.py operate --node implement
 ```
 
-Preflight проверяет граф, профиль исполнителя, разрешения, skill decisions, целостность локальных копий и доступность обязательных внешних условий.
+Preflight проверяет граф, профиль исполнителя, разрешения, skill decisions, целостность локальных копий и доступность обязательных внешних условий. Ответ также содержит `effective_configuration` — строку матрицы для этого узла с режимами и источниками, `required_artifacts` — обязательные артефакты узла, и `self_modification` — базовую ссылку, merge base и список защищённых путей, которые меняет текущая ветка (`.agent-flow/`, `AGENTS.md`, `CLAUDE.md`, `.github/workflows/`, `.github/devflow/prompts/`, обе копии скилла `devflow-node`). Если базу нельзя определить локально, preflight говорит об этом прямо и не угадывает.
 
 ### 6. Найти причину сбоя
 
@@ -267,7 +356,7 @@ python3 .agent-flow/devflow.py audit all --deep
 python3 .agent-flow/devflow.py scheme check
 ```
 
-`doctor` подходит для регулярной проверки. `scheme check` нужен при повторных сбоях, смене модели, стека или архитектуры, обновлении VibeCode Control или наступлении даты пересмотра скилла.
+`doctor` подходит для регулярной проверки; его проверка `managed-blocks` даёт `BLOCKED` при отсутствующем блоке или задвоенных маркерах и `PARTIAL`, если блок устарел относительно назначенных ролей. `scheme check` нужен при повторных сбоях, смене модели, стека или архитектуры, обновлении VibeCode Control или наступлении даты пересмотра скилла.
 
 ### 7. Проверить или откатить применённый план
 
@@ -293,7 +382,7 @@ python3 <path-to-devflow.py> --repo <project>
 
 ```text
 devflow --version
-devflow help [overview|modes|setup|configuration|skills|safety|windows]
+devflow help [overview|modes|setup|configuration|install|skills|safety|windows]
 devflow inspect [--deep] [--output .agent-flow/.local/reports/<new-name>.json]
 devflow audit git|code|quality|ci|docs|security|skills|all [--deep]
 devflow doctor [--deep] [--refresh-skills] [--repair-plan]
@@ -306,6 +395,7 @@ devflow scheme check [--no-refresh-skills]
 <summary><strong>Установка, обновление, планы и rollback</strong></summary>
 
 ```text
+devflow install [--client codex|claude|both] [--apply] [--force] [--home <path>]
 devflow init|adopt|upgrade [--apply] [--full-diff] [--diff-path <relative-path>]
 devflow plan init|adopt|upgrade|repair [--output .agent-flow/.local/plans/<new-name>.json] [--full-diff] [--diff-path <relative-path>]
 devflow apply --plan <relative-path> --expected-sha256 <reviewed-plan-sha256>
@@ -314,7 +404,7 @@ devflow rollback <run-id> --expected-manifest-sha256 <manifest-sha256>
 devflow scheme repair [--apply]
 ```
 
-Без `--apply` изменяющие режимы показывают план. Сохранённый план применяется только с SHA-256, который был выведен при сохранении именно этой версии плана.
+Без `--apply` изменяющие режимы показывают план. Сохранённый план применяется только с SHA-256, который был выведен при сохранении именно этой версии плана. `devflow install` относится к пользовательским копиям скилла, а не к репозиторию проекта: он пишет только в `~/.agents/skills/vibecode-control` или `~/.claude/skills/vibecode-control`.
 
 </details>
 
@@ -338,12 +428,17 @@ devflow next
 
 ```text
 devflow graph --format mermaid|table|json
+devflow graph --migrate [--apply] [--full-diff]
 devflow config show [--effective]
+devflow config effective [--format table|json]
+devflow config normalize [--apply] [--full-diff]
 devflow config set <dotted-path> <JSON-or-string>
 devflow role set <role> <agent>
 devflow model set <role-or-node> <model> [--effort <level>]
 devflow permissions set <role-or-node> <profile>
 ```
+
+`config effective` печатает матрицу узлов с режимом и источником каждого `model` и `effort`. `config normalize` переводит установленный проект на типизированную запись этих параметров: без `--apply` — план и diff, повторный запуск — `NOT_APPLICABLE`. `graph --migrate` добавляет графу, написанному до контракта артефактов review, недостающие `evidence_contract` — только по узлам канонического поставляемого графа; остальные review-узлы попадают в `requires_explicit_decision` и требуют явного решения оператора. В `model set` значение принимается и как конкретная модель, и как `inherit`, `unset` или `not-applicable`; после переназначения роли выполните `devflow upgrade`, чтобы обновить управляемые блоки инструкций.
 
 </details>
 
@@ -375,11 +470,17 @@ devflow skills evaluate <node>
 
 ```text
 devflow operate --node <id>
-devflow run record --node <id> --status <status> --head-sha <sha> --issue <ref> --pr <ref> --evidence "<expected-evidence>=<artifact-ref>" [--actual-agent <id>] [--actual-model <id>] [--actual-effort <level>]
+devflow run record --node <id> --status <status> --head-sha <sha> --issue <ref> --pr <ref> --evidence "<expected-evidence>=<artifact-ref>" [--check NAME=CONCLUSION] [--actual-agent <id>] [--actual-model <id>] [--actual-effort <level>]
 devflow run show [run-id]
 ```
 
 Для успешной записи delivery-узла нужны фактический Git HEAD, чистое рабочее дерево, Issue/PR, пройденный preflight, реальный профиль исполнителя и отдельная ссылка на артефакт для каждого ожидаемого evidence.
+
+Узел может объявить `evidence_contract`: имя из `expected_evidence` → `{"kind": "review"|"comment"|"findings"|"report"|"check-run", "required": true}`. В поставляемом графе он объявлен у `implementer_review` («отчёт самопроверки» → `findings`) и у `final_review` («вердикт review, привязанный к head SHA» → `review`). Review-узел без обязательного артефакта даёт предупреждение валидации: оно называет узел и говорит, что `PASS` для него запрещён, пока граф не мигрирован. Граф при этом остаётся валидным, поэтому `doctor`, `upgrade` и сама миграция продолжают работать. Гейт стоит там, где он и нужен: `devflow run record` отказывает в `PASS` на review-узле без объявленного обязательного артефакта и называет в ошибке команду миграции. Правила формы остаются жёсткими ошибками валидации: ключ контракта, которого нет в `expected_evidence`, неизвестный вид артефакта и небулево `required`. Каждый артефакт по контракту записывается как `<name>=<kind>:<reference>`.
+
+`--check NAME=CONCLUSION` записывает наблюдаемый результат проверки. Допустимые conclusion: `success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, `action_required`, `stale`. Проверку доказывает только `success`: любой другой записанный conclusion, включая зелёный `skipped`, блокирует `PASS`, а каждая проверка из `config.github.required_checks` должна быть отчитана с `success`. После merge не диспатчьте workflow против закрытого PR, если ему нужен `refs/pull/<N>/merge`: на post-merge-узле (id `post_merge` или состояние `POST_MERGE_VERIFY`) CLI отклоняет evidence с такой ссылкой, потому что у закрытого PR её нет и запуск по ней фабрикует результат. До merge этот ref — канонический ориентир merge-гейта и остаётся рабочим.
+
+Запись запуска хранит `checks`, а также `configured.modes` и `configured.sources` по каждому параметру. Сверка настроенного с фактическим учитывает режим: `explicit` обязан совпасть точно; `inherited` требует фактически наблюдённое значение; `unset` требует наблюдённое значение и остаётся `unset` в конфигурации; `not-applicable` отвергает любое фактическое значение как выдуманное.
 
 </details>
 
@@ -441,7 +542,9 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 python3 scripts/devflow.py --version
 ```
 
-Текущий набор содержит 61 автоматический тест: установка и обновление, граф, rollback, checksum drift, повреждённая конфигурация, опасные сторонние скиллы, delivery evidence и remote-gate preflight.
+Текущий набор содержит 90 автоматических тестов: установка и обновление, граф, rollback, checksum drift, повреждённая конфигурация, опасные сторонние скиллы, delivery evidence, remote-gate preflight, типизированные model и effort, матрица эффективной конфигурации, миграция `config normalize` и `graph --migrate`, гейт review-артефактов и установка пользовательского скилла.
+
+В Windows задайте `PYTHONUTF8=1` перед запуском тестов (`$env:PYTHONUTF8 = "1"`). Два теста проверяют symlink и требуют режима разработчика или прав администратора.
 
 ## Дополнительные материалы
 

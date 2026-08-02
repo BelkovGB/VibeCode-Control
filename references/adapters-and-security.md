@@ -3,17 +3,27 @@
 ## Contents
 
 1. Enforcement boundary
-2. Background Codex and Claude
-3. Git and GitHub audit
-4. CI/CD gates
-5. Observability
-6. Security boundaries
+2. Client portability boundary
+3. Background Codex and Claude
+4. Managed instructions and guarded paths
+5. Git and GitHub audit
+6. CI/CD gates
+7. Observability
+8. Security boundaries
 
 ## Enforcement boundary
 
 The personal VibeCode Control skill teaches and installs the workflow. The project CLI validates configuration, creates reversible file plans, verifies the graph and skill integrity, and records evidence. GitHub, CI, runner configuration, hooks, tests, and deployment systems enforce real external gates.
 
 Do not claim that a `SKILL.md`, prompt, or workflow file alone blocks merge or runs continuously.
+
+## Client portability boundary
+
+Workflow logic is shared. The graph, stages, gates, evidence contracts, and node permissions mean the same thing for Codex and for Claude.
+
+Execution configuration is client-specific. Agent identifiers, model names, effort vocabularies, and permission profiles are not interchangeable and must not be copied from one client to another without an explicit recorded decision.
+
+Moving a stage between clients does not carry the source client's default model or effort with it. Resolve the parameters again for the target client: an `explicit` value is chosen anew, an `inherited` value is observed in the new client at run time and recorded, and an `unset` parameter stays absent instead of acquiring the previous client's default.
 
 ## Background Codex and Claude
 
@@ -26,6 +36,8 @@ Background environments do not necessarily inherit personal local skills. Commit
 
 VibeCode Control installs `devflow-node` to both locations. The background prompt must identify the exact node and every required external skill. Preflight validates node decision, target compatibility, presence, and checksum.
 
+User-level skills are a different scope and do not travel with the repository. `devflow install [--client codex|claude|both]` installs or updates this skill at `~/.agents/skills/vibecode-control` for Codex and `~/.claude/skills/vibecode-control` for Claude. The dry run reports source, target, file count, total bytes, source checksum, installed checksum, and the create/update/remove lists; `--apply` writes atomically, deletes files left over from a previous install, and re-hashes the installed tree against the source. Installation refuses a symlinked target, refuses to overwrite a different skill at that path without `--force`, never writes outside the selected client's skills directory, and never copies `.git` or folds it into the checksum.
+
 Compare both background copies with the canonical toolkit package. Two identical changed copies do not prove integrity. For review and release nodes, keep preflight blocked until the GitHub adapter, required-check set, and applicable merge ruleset have verified setup evidence.
 
 For Codex GitHub Action or another Codex runner:
@@ -33,7 +45,7 @@ For Codex GitHub Action or another Codex runner:
 - check out the repository before invoking Codex;
 - use the narrowest sandbox and permissions;
 - provide a committed prompt file;
-- pass the configured model and effort explicitly where supported;
+- pass the effective model and effort from `devflow config effective`, never a client default: an `inherited` parameter is observed in the run and recorded, an `unset` parameter stays absent;
 - sanitize Issue, PR, commit, and HTML inputs against prompt injection;
 - keep secrets out of untrusted PR context;
 - capture structured output and evidence;
@@ -45,8 +57,29 @@ For Claude cloud/GitHub execution:
 
 - rely on committed `.claude/skills`, not only `~/.claude/skills`;
 - invoke the node skill and assigned skills explicitly;
-- verify the actual model, effort, permissions, tools, and repository checkout;
+- verify the actual model, effort, permissions, tools, and repository checkout against the effective configuration and the mode of each parameter;
+- read the generated managed block in `CLAUDE.md` for the roles this project actually assigns to Claude, instead of assuming the implementer role;
 - do not assume local user settings transfer to the remote session.
+
+## Managed instructions and guarded paths
+
+The Claude managed block is generated from the installed configuration, not shipped as a fixed template. It lists exactly the roles whose agent maps to Claude, their permission profiles, and the workflow nodes they own; it grants merge authority only when `release-operator` is assigned and otherwise states that merging is not permitted; and when no role is assigned to Claude it says exactly that. It always forbids combining implementation and independent final review in one session. `AGENTS.md` carries the client-neutral process block shipped to every project.
+
+Do not compare a managed block against remembered text. `devflow doctor` runs a `managed-blocks` check: a missing block or duplicated markers is `BLOCKED`; a block that is stale relative to the configured roles is `PARTIAL` with the recommendation to run `devflow upgrade`. Blocks are regenerated by `init`, `adopt`, `upgrade`, and `repair`. `role set` does not widen the write allowlist, so run `devflow upgrade` after reassigning a role to refresh the instructions.
+
+Guarded control-plane paths:
+
+```text
+.agent-flow/
+AGENTS.md
+CLAUDE.md
+.github/workflows/
+.github/devflow/prompts/
+.agents/skills/devflow-node/
+.claude/skills/devflow-node/
+```
+
+`devflow operate --node <id>` returns `self_modification` with the base ref used, the merge base, and the guarded paths this branch changes. When the base cannot be determined locally, the report says so explicitly and leaves `self_modifying` unresolved instead of assuming the branch is safe; the base/head comparison then belongs to the GitHub adapter. A branch that rewrites its own verifier must be reviewed against the version that actually executed: check annotations and logs rather than the conclusion alone, do not re-run without changing the cause, and never dispatch a post-merge check against a closed PR whose evidence would need `refs/pull/<N>/merge`.
 
 ## Git and GitHub audit
 
@@ -101,9 +134,9 @@ Each background run should leave:
 - run ID;
 - Issue, branch, and PR;
 - workflow node and state;
-- configured and actual role, agent, model, effort, and permissions;
+- configured and actual role, agent, model, effort, and permissions, with the mode and source of each configured parameter;
 - loaded skills and pinned versions;
-- commands and check results;
+- commands and check conclusions; only `success` proves a check, and a green `skipped` does not;
 - evidence artifacts;
 - current head SHA and reviewed SHA;
 - final status;
