@@ -70,6 +70,8 @@ Two rules apply to every row:
 | Remote is configured and observable | `git-github` stage evidence | `git remote add origin https://github.com/<owner>/<repo>.git` | `git remote -v` → one `origin` entry | gap `Git remote is not configured or not observable` |
 | `origin/HEAD` resolves | default-branch reporting in `devflow inspect` | `git remote set-head origin --auto` | `git symbolic-ref refs/remotes/origin/HEAD` → `refs/remotes/origin/main` | `inspect` reports `default_branch: unverified` |
 
+Install VibeCode Control in the mode the inspection recommends, not the one you expected. `devflow inspect` reports `recommended_mode`, and on a repository that already contains project files `devflow init` refuses with exit code 2 and `Репозиторий уже содержит проектные файлы. Используйте adopt вместо init.` — that refusal is the contract working, and `adopt` is the mode to use.
+
 Rulesets and branch protection are not available on every plan for private repositories. If your plan does not offer them, that is a real limit: make the repository public, upgrade, or accept that the merge gate stays `BLOCKED`. Do not record `ruleset_verified` to work around a plan limit.
 
 ## Branch ruleset and merge protection
