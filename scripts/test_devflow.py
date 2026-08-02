@@ -241,12 +241,17 @@ class DevflowTestCase(unittest.TestCase):
         self.assertTrue(any("schema_version" in item for item in errors))
         self.assertTrue(any("тот же узел" in item for item in errors))
 
-    def test_inherited_models_are_reported_as_unverified(self):
+    def test_declared_inherited_and_unset_modes_are_decisions_not_warnings(self):
+        # Semantic change: a declared `inherited` or `unset` mode no longer warns.
+        # It carries no value to verify, and a permanent warning made preflight PARTIAL,
+        # which made a delivery PASS unreachable for both honest modes.  The requirement
+        # is enforced in record_run instead, where the observed value must be supplied.
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["effort"] = {"mode": "unset"}
         errors, warnings = devflow.validate_config(config)
         self.assertEqual(errors, [])
-        self.assertTrue(any("наследуется" in item for item in warnings))
+        self.assertEqual(warnings, [])
 
     def test_secret_scan_reports_path_not_value(self):
         secret = "gh" + "p_" + "abcdefghijklmnopqrstuvwxyz123456"
@@ -1097,6 +1102,66 @@ class DevflowTestCase(unittest.TestCase):
         self.assertEqual(recorded["status"], "PASS")
         stored = devflow.load_json(Path(recorded["path"]))
         self.assertEqual(stored["checks"], {"tests": "failure"})
+
+    def prepare_honest_delivery_state(self, required_checks=("tests",)):
+        """A project that declares inherited/unset modes instead of pinning a model."""
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["roles"]["implementer"]["model"] = {"mode": "inherited"}
+        config["roles"]["implementer"]["effort"] = {"mode": "unset"}
+        config["automation"]["background_workers"] = "verified"
+        config["github"]["remote_settings"] = "verified"
+        config["github"]["ruleset_verified"] = True
+        config["github"]["required_checks"] = list(required_checks)
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        self.resolve_all_skill_decisions()
+
+    def test_inherited_and_unset_modes_reach_a_delivery_pass_with_observed_values(self):
+        self.apply_init()
+        self.prepare_honest_delivery_state()
+        head = self.commit_worktree()
+        self.assertEqual(devflow.operate_preflight(self.repo, "implement")["status"], "PASS")
+        recorded = devflow.record_run(
+            self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+            ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+             "updated architecture docs when required=n/a"],
+            "claude-code", "claude-opus-5", "high", ["tests=success"],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["configured"]["modes"]["model"], "inherited")
+        self.assertEqual(stored["configured"]["modes"]["effort"], "unset")
+        self.assertEqual(stored["actual"], {"agent": "claude-code", "model": "claude-opus-5", "effort": "high"})
+
+    def test_inherited_mode_still_requires_the_observed_value(self):
+        self.apply_init()
+        self.prepare_honest_delivery_state()
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+                ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+                 "updated architecture docs when required=n/a"],
+                "claude-code", None, "high", ["tests=success"],
+            )
+        self.assertIn("наследуется", str(context.exception))
+
+    def test_blocked_preflight_names_its_reason(self):
+        self.apply_init()
+        self.prepare_honest_delivery_state()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["automation"]["background_workers"] = "unverified"
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+                ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+                 "updated architecture docs when required=n/a"],
+                "claude-code", "claude-opus-5", "high", ["tests=success"],
+            )
+        message = str(context.exception)
+        self.assertNotIn("preflight вернул PARTIAL: причина не сообщена", message)
+        self.assertIn("Background executor", message)
 
     def test_green_skipped_conclusion_is_not_a_passed_check(self):
         self.apply_init()

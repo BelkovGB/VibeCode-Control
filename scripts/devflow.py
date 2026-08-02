@@ -1448,17 +1448,9 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
     for role, parsed in typed_roles.items():
         entry = parsed.get("model", {"mode": MODE_UNSET})
         mode = entry.get("mode")
-        if mode == MODE_INHERITED:
-            warnings.append(
-                f"Модель для роли {role} наследуется; фактические model и effort должны быть проверены и записаны при запуске"
-            )
-            continue
-        if mode == MODE_UNSET:
-            warnings.append(
-                f"Модель для роли {role} намеренно не задана (mode={MODE_UNSET}); "
-                "она не будет подставлена и должна быть зафиксирована как фактическая при запуске"
-            )
-            continue
+        # A declared `inherited` or `unset` mode is a decision, not a gap: there is no
+        # value to verify against a model list.  Honesty is enforced when evidence is
+        # recorded, where the actually observed value must be supplied.
         if mode != MODE_EXPLICIT:
             continue
         model = entry.get("value")
@@ -3812,9 +3804,18 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                     )
         preflight = operate_preflight(repo, node)
         if preflight["status"] != "PASS":
+            reasons = (
+                preflight.get("external_gaps", [])
+                + preflight.get("skills", {}).get("errors", [])
+                + preflight.get("skills", {}).get("warnings", [])
+                + preflight.get("config", {}).get("errors", [])
+                + preflight.get("config", {}).get("warnings", [])
+                + preflight.get("workflow", {}).get("errors", [])
+                + preflight.get("workflow", {}).get("warnings", [])
+            )
             raise DevflowError(
-                "PASS запрещён: operate preflight не прошёл: "
-                + "; ".join(preflight.get("external_gaps", []) + preflight.get("skills", {}).get("errors", []))
+                f"PASS запрещён: operate preflight вернул {preflight['status']}: "
+                + ("; ".join(str(item) for item in reasons) or "причина не сообщена адаптером preflight")
             )
         resolution = effective.get("resolution", {})
         observed = {"agent": actual_agent, "model": actual_model, "effort": actual_effort}
