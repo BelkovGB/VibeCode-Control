@@ -54,7 +54,15 @@ MODE_EXPLICIT = "explicit"
 MODE_INHERITED = "inherited"
 MODE_UNSET = "unset"
 MODE_NOT_APPLICABLE = "not-applicable"
-CONFIG_MODES = {MODE_EXPLICIT, MODE_INHERITED, MODE_UNSET, MODE_NOT_APPLICABLE}
+# `undecided` and `unset` both carry no value, and neither may be materialized, but they
+# are different facts: `undecided` means nobody has chosen yet and the shipped template
+# supplies it, while `unset` is the project owner's decision that the parameter is
+# absent.  Only `undecided` holds setup and execution.
+MODE_UNDECIDED = "undecided"
+CONFIG_MODES = {MODE_EXPLICIT, MODE_INHERITED, MODE_UNSET, MODE_NOT_APPLICABLE, MODE_UNDECIDED}
+# The reserved agent identifier for "no executor has been chosen".  It is not an agent,
+# so it never resolves to a client and never satisfies a delivery gate.
+AGENT_UNRESOLVED = "unresolved"
 TYPED_PROFILE_FIELDS = ("model", "effort")
 PROFILE_FIELDS = ("agent", "model", "effort", "permissions")
 # Agents that never execute a model, so an executable model/effort is a lie for them.
@@ -68,7 +76,8 @@ LEGACY_MODE_TOKENS = {
     "not_applicable": MODE_NOT_APPLICABLE,
     "n/a": MODE_NOT_APPLICABLE,
     "unset": MODE_UNSET,
-    "unconfigured": MODE_UNSET,
+    "unconfigured": MODE_UNDECIDED,
+    "undecided": MODE_UNDECIDED,
 }
 # Check conclusions that a remote adapter can report.  Only `success` proves a check.
 CHECK_CONCLUSIONS = {
@@ -1286,6 +1295,64 @@ def normalize_config(config: Any) -> tuple[dict[str, Any], list[str]]:
     return result, errors
 
 
+def pending_execution_decisions(config: Any, workflow: Any = None) -> list[dict[str, str]]:
+    """List the execution parameters nobody has chosen yet.
+
+    This is the typed marker the setup stage blocks on.  It is deliberately not a
+    validation warning: an owner who declares `unset` has decided, and that decision must
+    not hold the stage, while a template default must.
+    """
+    pending: list[dict[str, str]] = []
+    if not isinstance(config, dict):
+        return pending
+    roles = config.get("roles")
+    roles = roles if isinstance(roles, dict) else {}
+    used_roles = None
+    if isinstance(workflow, dict) and isinstance(workflow.get("nodes"), list):
+        used_roles = {
+            node.get("role") for node in workflow["nodes"]
+            if isinstance(node, dict) and node.get("role")
+        }
+    for role in sorted(roles):
+        settings = roles[role]
+        if not isinstance(settings, dict):
+            continue
+        if used_roles is not None and role not in used_roles:
+            continue
+        agent = settings.get("agent")
+        if not isinstance(agent, str) or not agent.strip() or agent.strip() == AGENT_UNRESOLVED:
+            pending.append({
+                "pointer": f"roles.{role}.agent",
+                "decision": "Выберите исполнителя роли",
+                "command": f"devflow role set {role} <agent>",
+            })
+        for field in TYPED_PROFILE_FIELDS:
+            entry, _ = parse_profile_value(settings.get(field, {"mode": MODE_UNDECIDED}), f"roles.{role}.{field}")
+            if entry.get("mode") == MODE_UNDECIDED:
+                pending.append({
+                    "pointer": f"roles.{role}.{field}",
+                    "decision": f"Выберите {field} или явно объявите отсутствие параметра",
+                    "command": f"devflow model set {role} <model|inherit|unset>",
+                })
+    overrides = config.get("node_overrides")
+    if isinstance(overrides, dict):
+        for node_id in sorted(overrides):
+            settings = overrides[node_id]
+            if not isinstance(settings, dict):
+                continue
+            for field in TYPED_PROFILE_FIELDS:
+                if field not in settings:
+                    continue
+                entry, _ = parse_profile_value(settings[field], f"node_overrides.{node_id}.{field}")
+                if entry.get("mode") == MODE_UNDECIDED:
+                    pending.append({
+                        "pointer": f"node_overrides.{node_id}.{field}",
+                        "decision": f"Выберите {field} для узла или снимите override",
+                        "command": f"devflow model set {node_id} <model|inherit|unset>",
+                    })
+    return pending
+
+
 def config_uses_legacy_profile(config: Any) -> list[str]:
     """List the pointers still using the untyped scalar spelling."""
     legacy: list[str] = []
@@ -1333,7 +1400,7 @@ def resolve_execution_profile(node: dict[str, Any], config: dict[str, Any]) -> d
             entry, _ = parse_profile_value(role[field], f"roles.{role_name}.{field}")
             origin = source("role", f"roles.{role_name}.{field}", CONFIG_PATH)
         else:
-            entry = {"mode": MODE_UNSET}
+            entry = {"mode": MODE_UNDECIDED}
             origin = source("absent", None, None)
         item = dict(entry)
         item["source"] = origin
@@ -1418,9 +1485,21 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
             parsed[field] = entry
         typed_roles[role] = parsed
         agent = settings.get("agent").strip() if isinstance(settings.get("agent"), str) else ""
+        if agent == AGENT_UNRESOLVED:
+            # No executor has been chosen, so neither may its model or effort be:
+            # anything else would be a value decided on behalf of the owner.
+            for field in TYPED_PROFILE_FIELDS:
+                if parsed[field]["mode"] != MODE_UNDECIDED:
+                    errors.append(
+                        f"roles.{role}.{field}: агент не выбран (`{AGENT_UNRESOLVED}`), "
+                        f"поэтому требуется mode={MODE_UNDECIDED}"
+                    )
+            continue
         executes = bool(agent) and agent not in NON_EXECUTING_AGENTS
         for field in TYPED_PROFILE_FIELDS:
             mode = parsed[field]["mode"]
+            if mode == MODE_UNDECIDED:
+                continue
             if agent and not executes and mode != MODE_NOT_APPLICABLE:
                 errors.append(
                     f"roles.{role}.{field}: агент {agent} не исполняет модель, "
@@ -1720,9 +1799,15 @@ def validate_workflow(workflow: dict[str, Any], config: dict[str, Any]) -> tuple
         resolution = resolve_execution_profile(node, config if isinstance(config, dict) else {})
         agent = resolution["agent"].get("value")
         executes = resolution.get("executes_model")
+        if agent == AGENT_UNRESOLVED:
+            # Nothing to cross-check until an executor is chosen; the roles setup stage
+            # reports the pending decision.
+            continue
         for field in TYPED_PROFILE_FIELDS:
             mode = resolution[field].get("mode")
             pointer = resolution[field].get("source", {}).get("pointer") or field
+            if mode == MODE_UNDECIDED:
+                continue
             if agent and not executes and mode != MODE_NOT_APPLICABLE:
                 errors.append(
                     f"Узел {node_id}: агент {agent} не исполняет модель, но {pointer} имеет mode={mode}; "
@@ -2646,6 +2731,13 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         context_gaps.append("Product stage and approved scope reference are not configured")
     if product_stage in {"development-readiness", "development", "maintenance"} and not config.get("project", {}).get("decision_ref"):
         context_gaps.append("Development stage lacks an explicit PM decision reference")
+    language = config.get("policy", {}).get("language") if isinstance(config.get("policy"), dict) else None
+    context_evidence.append(f"report_language={language or 'missing'}")
+    if not isinstance(language, str) or not language.strip() or language.strip() == MODE_UNDECIDED:
+        context_gaps.append(
+            "Report language is not chosen; the template ships no default: "
+            "devflow config set policy.language <language>"
+        )
     context_status = "BLOCKED" if context_gaps else "PASS"
     results.append(stage_result(
         "context", context_status, context_evidence, context_gaps,
@@ -2653,13 +2745,22 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         next_for["context"], "devflow config set project.product_stage <stage>", bool(context_gaps)
     ))
 
-    roles_status = "BLOCKED" if config_errors else ("PARTIAL" if config_warnings else "PASS")
+    # An undecided parameter blocks this stage through an explicit typed marker, not
+    # through a validation warning: the shipped template chooses nothing, and a project
+    # that has not chosen yet must not look configured.
+    pending = pending_execution_decisions(config, workflow)
+    roles_status = "BLOCKED" if config_errors or pending else ("PARTIAL" if config_warnings else "PASS")
     results.append(stage_result(
         "roles", roles_status,
-        [f"Configured logical roles: {len(config.get('roles', {}))}"],
-        config_errors + config_warnings,
+        [f"Configured logical roles: {len(config.get('roles', {}))}",
+         f"Pending execution decisions: {len(pending)}"],
+        config_errors + config_warnings + [
+            f"{item['pointer']}: {item['decision']} — `{item['command']}`" for item in pending
+        ],
         "Verify concrete agents, models, effort, and permissions for the next runs; never use silent fallback.",
-        next_for["roles"], "devflow config show --effective", False
+        next_for["roles"],
+        pending[0]["command"] if pending else "devflow config effective",
+        bool(pending),
     ))
 
     graph_status = "BLOCKED" if graph_errors else ("PARTIAL" if graph_warnings else "PASS")
@@ -3555,6 +3656,20 @@ def operate_preflight(repo: Path, node_id: str) -> dict[str, Any]:
     external_gaps: list[str] = []
     external_blockers: list[str] = []
     effective = effective_node(nodes[node_id], config, lock)
+    # A node whose executor or execution parameters are still undecided cannot run: the
+    # template supplied no choice and nobody has made one.
+    resolution = effective.get("resolution", {})
+    if resolution.get("agent", {}).get("value") in {None, AGENT_UNRESOLVED}:
+        external_blockers.append(
+            f"Исполнитель узла {node_id} не выбран: задайте `devflow role set {nodes[node_id].get('role')} <agent>`"
+        )
+    for field in TYPED_PROFILE_FIELDS:
+        if resolution.get(field, {}).get("mode") == MODE_UNDECIDED:
+            pointer = resolution[field].get("source", {}).get("pointer") or f"roles.{nodes[node_id].get('role')}.{field}"
+            external_blockers.append(
+                f"Параметр {pointer} не выбран (mode={MODE_UNDECIDED}); "
+                "объявите значение, наследование или явное отсутствие"
+            )
     if effective.get("agent") not in {"human", "script", "deterministic"}:
         automation = config.get("automation", {}) if isinstance(config.get("automation", {}), dict) else {}
         if automation.get("background_workers") != "verified":
@@ -3839,6 +3954,11 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                     raise DevflowError(
                         f"Параметр {field} наследуется: PASS требует зафиксировать фактически использованное значение"
                     )
+            elif mode == MODE_UNDECIDED:
+                raise DevflowError(
+                    f"Параметр {field} ещё не выбран (mode={MODE_UNDECIDED}): "
+                    "нельзя записать PASS для узла, исполнение которого никто не решал"
+                )
             elif not actual_value:
                 raise DevflowError(
                     f"Параметр {field} намеренно не задан (mode={MODE_UNSET}): "

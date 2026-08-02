@@ -59,7 +59,7 @@
   "$defs": {
     "typedParameter": {
       "title": "Typed execution parameter",
-      "description": "A model or effort parameter always states its mode. `unset` means the parameter is deliberately absent and must never be materialized into a concrete value. A bare string is the legacy spelling, accepted on read and normalized on write.",
+      "description": "A model or effort parameter always states its mode. `undecided` means nobody has chosen yet and is what the neutral template ships; it blocks setup and execution. `unset` means the project owner decided the parameter is absent; it does not block. Neither is ever materialized into a concrete value. A bare string is the legacy spelling, accepted on read and normalized on write.",
       "oneOf": [
         {
           "type": "object",
@@ -74,7 +74,7 @@
           "type": "object",
           "required": ["mode"],
           "properties": {
-            "mode": {"enum": ["inherited", "unset", "not-applicable"]}
+            "mode": {"enum": ["inherited", "unset", "not-applicable", "undecided"]}
           },
           "additionalProperties": false
         },

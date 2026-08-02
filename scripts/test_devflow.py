@@ -222,7 +222,9 @@ class DevflowTestCase(unittest.TestCase):
     def test_specific_unverified_model_is_reported(self):
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")
+        config["roles"]["reviewer"]["agent"] = "codex"
         config["roles"]["reviewer"]["model"] = "future-model"
+        config["roles"]["reviewer"]["effort"] = {"mode": "unset"}
         errors, warnings = devflow.validate_config(config)
         self.assertEqual(errors, [])
         self.assertTrue(any("не проверена" in item for item in warnings))
@@ -248,6 +250,8 @@ class DevflowTestCase(unittest.TestCase):
         # is enforced in record_run instead, where the observed value must be supplied.
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["agent"] = "codex"
+        config["roles"]["qa"]["model"] = {"mode": "inherited"}
         config["roles"]["qa"]["effort"] = {"mode": "unset"}
         errors, warnings = devflow.validate_config(config)
         self.assertEqual(errors, [])
@@ -511,6 +515,11 @@ class DevflowTestCase(unittest.TestCase):
         config, workflow, lock = devflow.load_project_state(self.repo)
         graph = devflow.render_graph(workflow, config, lock, "mermaid")
         self.assertIn("flowchart TD", graph)
+        self.assertIn("unresolved", graph)
+        self.assertNotIn("claude-code", graph)
+        self.choose_executors(agent="claude-code")
+        config, workflow, lock = devflow.load_project_state(self.repo)
+        graph = devflow.render_graph(workflow, config, lock, "mermaid")
         self.assertIn("claude-code", graph)
         self.assertNotIn("<br/>", graph)
 
@@ -627,10 +636,8 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_release_preflight_blocks_unverified_github_controls(self):
         self.apply_init()
+        self.choose_executors()
         config, _, lock = devflow.load_project_state(self.repo)
-        for settings in config["roles"].values():
-            if settings["agent"] != "human":
-                settings["model"] = "verified-model"
         config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["verified-model"]}
         config["automation"]["background_workers"] = "verified"
         for decision in lock["node_decisions"].values():
@@ -779,6 +786,19 @@ class DevflowTestCase(unittest.TestCase):
             text=True, capture_output=True, check=True,
         ).stdout.strip()
 
+    def choose_executors(self, agent="codex", model="verified-model", effort="high",
+                         implementer_agent=None):
+        """Make the role decisions the neutral template deliberately leaves to the owner."""
+        config, _, _ = devflow.load_project_state(self.repo)
+        for role, settings in config["roles"].items():
+            if settings["agent"] == "human":
+                continue
+            settings["agent"] = implementer_agent if implementer_agent and role == "implementer" else agent
+            settings["model"] = {"mode": "explicit", "value": model} if model else {"mode": "inherited"}
+            settings["effort"] = {"mode": "explicit", "value": effort} if effort else {"mode": "unset"}
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        return config
+
     def resolve_all_skill_decisions(self):
         _, workflow, lock = devflow.load_project_state(self.repo)
         devflow.initialize_skill_decisions(lock, workflow)
@@ -786,13 +806,10 @@ class DevflowTestCase(unittest.TestCase):
             decision.update({"status": "zero-skill", "assigned": [], "reason": "test", "revalidation_required": False})
         devflow.write_project_json(self.repo, devflow.SKILLS_LOCK_PATH, lock, "skills-decision")
 
-    def prepare_verified_delivery_state(self, required_checks=("unit",)):
+    def prepare_verified_delivery_state(self, required_checks=("unit",), agent="codex"):
         """Bring a freshly installed project to a state where a delivery PASS is reachable."""
+        self.choose_executors(agent=agent)
         config, _, _ = devflow.load_project_state(self.repo)
-        for settings in config["roles"].values():
-            if settings["agent"] == "human":
-                continue
-            settings["model"] = {"mode": "explicit", "value": "verified-model"}
         config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["verified-model"]}
         config["automation"]["background_workers"] = "verified"
         config["github"]["remote_settings"] = "verified"
@@ -826,6 +843,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_legacy_scalar_config_normalizes_deterministically_and_idempotently(self):
         self.apply_init()
+        self.choose_executors()
         config, _, _ = devflow.load_project_state(self.repo)
         config["roles"]["qa"]["model"] = "inherit"
         config["roles"]["qa"]["effort"] = "high"
@@ -850,6 +868,8 @@ class DevflowTestCase(unittest.TestCase):
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("не исполняет модель" in item for item in errors))
         config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["agent"] = "codex"
+        config["roles"]["qa"]["model"] = {"mode": "inherited"}
         config["roles"]["qa"]["effort"] = {"mode": "not-applicable"}
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("недопустим для исполняющего агента" in item for item in errors))
@@ -906,6 +926,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_codex_to_claude_transfer_keeps_modes_and_rewrites_managed_instructions(self):
         self.apply_init()
+        self.choose_executors(agent="codex", implementer_agent="claude-code", model=None)
         for role in ["product-lead", "researcher", "architect", "reviewer", "qa", "release-operator"]:
             devflow.configure_role(self.repo, role, "claude-code")
         devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "transfer"))
@@ -921,6 +942,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_claude_to_codex_transfer_removes_claimed_claude_authority(self):
         self.apply_init()
+        self.choose_executors(agent="codex", implementer_agent="claude-code")
         devflow.configure_role(self.repo, "implementer", "codex")
         devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "transfer-back"))
         block = (self.repo / "CLAUDE.md").read_text(encoding="utf-8")
@@ -988,7 +1010,7 @@ class DevflowTestCase(unittest.TestCase):
                 self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
                 ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
                  "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
-                "codex", "verified-model", "xhigh", ["unit=success"],
+                "codex", "verified-model", "high", ["unit=success"],
             )
         self.assertIn("graph --migrate", str(context.exception))
 
@@ -996,6 +1018,9 @@ class DevflowTestCase(unittest.TestCase):
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")
         workflow = devflow.load_json(kit / "workflow.json")
+        for role, settings in config["roles"].items():
+            if settings["agent"] != "human":
+                settings.update({"agent": "codex", "model": {"mode": "inherited"}, "effort": {"mode": "unset"}})
         config["node_overrides"] = {"implement": {"model": {"mode": "not-applicable"}}}
         errors, _ = devflow.validate_workflow(workflow, config)
         self.assertTrue(any("исполняет модель" in item and "implement" in item for item in errors))
@@ -1016,6 +1041,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_role_set_refuses_to_write_a_configuration_it_would_invalidate(self):
         self.apply_init()
+        self.choose_executors(agent="claude-code")
         with self.assertRaises(devflow.DevflowError) as context:
             devflow.configure_role(self.repo, "implementer", "human")
         self.assertIn("невалидна", str(context.exception))
@@ -1024,6 +1050,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_unrelated_run_stays_verifiable_after_a_later_configuration_change(self):
         self.apply_init()
+        self.choose_executors()
         self.resolve_all_skill_decisions()
         marked = devflow.mark_setup_stage(self.repo, "pilot", "PARTIAL", ["pending"], "note")
         devflow.configure_model(self.repo, "qa", "inherit", "low")
@@ -1059,7 +1086,7 @@ class DevflowTestCase(unittest.TestCase):
                 self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
                 ["review verdict bound to head SHA=https://example.invalid/pr/1",
                  "closed blocking threads=none"],
-                "codex", "verified-model", "xhigh", ["unit=success"],
+                "codex", "verified-model", "high", ["unit=success"],
             )
         self.assertIn("review:", str(context.exception))
 
@@ -1071,7 +1098,7 @@ class DevflowTestCase(unittest.TestCase):
             self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
             ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
              "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
-            "codex", "verified-model", "xhigh", ["unit=success"],
+            "codex", "verified-model", "high", ["unit=success"],
         )
         self.assertEqual(recorded["status"], "PASS")
         stored = devflow.load_json(Path(recorded["path"]))
@@ -1081,7 +1108,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_red_node_passes_with_required_checks_configured_and_no_check_claims(self):
         self.apply_init()
-        self.prepare_verified_delivery_state(required_checks=("tests",))
+        self.prepare_verified_delivery_state(required_checks=("tests",), agent="claude-code")
         head = self.commit_worktree()
         recorded = devflow.record_run(
             self.repo, "tdd_red", "PASS", head, "ISSUE-1", "PR-1",
@@ -1092,7 +1119,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def test_red_node_records_a_failing_check_as_evidence_without_blocking(self):
         self.apply_init()
-        self.prepare_verified_delivery_state(required_checks=("tests",))
+        self.prepare_verified_delivery_state(required_checks=("tests",), agent="claude-code")
         head = self.commit_worktree()
         recorded = devflow.record_run(
             self.repo, "tdd_red", "PASS", head, "ISSUE-1", "PR-1",
@@ -1105,6 +1132,7 @@ class DevflowTestCase(unittest.TestCase):
 
     def prepare_honest_delivery_state(self, required_checks=("tests",)):
         """A project that declares inherited/unset modes instead of pinning a model."""
+        self.choose_executors(agent="claude-code", model=None)
         config, _, _ = devflow.load_project_state(self.repo)
         config["roles"]["implementer"]["model"] = {"mode": "inherited"}
         config["roles"]["implementer"]["effort"] = {"mode": "unset"}
@@ -1172,7 +1200,7 @@ class DevflowTestCase(unittest.TestCase):
                 self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
                 ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
                  "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
-                "codex", "verified-model", "xhigh", ["unit=skipped"],
+                "codex", "verified-model", "high", ["unit=skipped"],
             )
         self.assertIn("skipped", str(context.exception))
 
@@ -1185,7 +1213,7 @@ class DevflowTestCase(unittest.TestCase):
                 self.repo, "final_review", "PASS", head, "ISSUE-1", "PR-1",
                 ["review verdict bound to head SHA=review:https://example.invalid/pr/1#review-9",
                  "closed blocking threads=comment:https://example.invalid/pr/1#threads"],
-                "codex", "verified-model", "xhigh", [],
+                "codex", "verified-model", "high", [],
             )
         self.assertIn("conclusion=success", str(context.exception))
 
@@ -1256,6 +1284,114 @@ class DevflowTestCase(unittest.TestCase):
             devflow.install_skill("codex", apply=True, home=home)
         self.assertIn("--force", str(context.exception))
         self.assertEqual(devflow.install_skill("codex", apply=True, home=home, force=True)["status"], "PASS")
+
+
+    # --- neutral public template ------------------------------------------------------
+
+    def test_shipped_kit_names_no_executor_model_or_effort(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        for role, settings in config["roles"].items():
+            if settings["agent"] == "human":
+                # human-pm is the structural human role, not a vendor choice.
+                self.assertEqual(settings["model"], {"mode": "not-applicable"})
+                self.assertEqual(settings["effort"], {"mode": "not-applicable"})
+                continue
+            self.assertEqual(settings["agent"], devflow.AGENT_UNRESOLVED, role)
+            self.assertEqual(settings["model"], {"mode": "undecided"}, role)
+            self.assertEqual(settings["effort"], {"mode": "undecided"}, role)
+        self.assertEqual(config["policy"]["language"], "undecided")
+        errors, warnings = devflow.validate_config(config)
+        self.assertEqual(errors, [])
+        self.assertEqual(warnings, [])
+
+    def test_kit_and_managed_material_carry_no_owner_identifiers(self):
+        kit = devflow.find_project_kit(self.repo)
+        forbidden = ["belkov", "BelkovGB", "belkovgb", "@gmail", "masha", "vibe/automode"]
+        checked = 0
+        for path in sorted(kit.rglob("*")):
+            if not path.is_file():
+                continue
+            checked += 1
+            text = path.read_text(encoding="utf-8", errors="replace").lower()
+            for needle in forbidden:
+                self.assertNotIn(needle.lower(), text, f"{path.name} carries {needle}")
+        self.assertGreater(checked, 5)
+
+    def test_fresh_install_inherits_no_layout_and_stops_setup_at_roles(self):
+        self.apply_init()
+        matrix = devflow.effective_configuration_from_files(self.repo)
+        machine_rows = [row for row in matrix["rows"] if row["owner"] != "human-pm"]
+        self.assertTrue(machine_rows)
+        for row in machine_rows:
+            self.assertEqual(row["agent"], devflow.AGENT_UNRESOLVED, row["node"])
+            self.assertIsNone(row["model"], row["node"])
+            self.assertIsNone(row["effort"], row["node"])
+            self.assertEqual(row["model_mode"], "undecided", row["node"])
+            self.assertEqual(row["effort_mode"], "undecided", row["node"])
+        pending = devflow.pending_execution_decisions(
+            devflow.load_json(self.repo / devflow.CONFIG_PATH),
+            devflow.load_json(self.repo / devflow.WORKFLOW_PATH),
+        )
+        self.assertTrue(any(item["pointer"].endswith(".agent") for item in pending))
+        stages = {item["stage"]: item for item in devflow.evaluate_setup(self.repo)}
+        self.assertEqual(stages["context"]["status"], "BLOCKED")
+        self.assertTrue(any("language" in gap.lower() for gap in stages["context"]["gaps"]))
+        self.assertEqual(stages["roles"]["status"], "BLOCKED")
+        self.assertTrue(stages["roles"]["requires_user_decision"])
+        self.assertTrue(any("roles.implementer.agent" in gap for gap in stages["roles"]["gaps"]))
+
+    def test_setup_reaches_roles_and_clears_it_only_after_explicit_choices(self):
+        self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["project"]["product_stage"] = "development-readiness"
+        config["project"]["decision_ref"] = "PM-1"
+        config["policy"]["language"] = "en"
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        step = devflow.next_setup_step(devflow.evaluate_setup(self.repo), self.repo)
+        self.assertEqual(step["stage"], "roles")
+        self.assertEqual(step["status"], "BLOCKED")
+        self.choose_executors(agent="codex", model=None, effort=None)
+        stages = {item["stage"]: item for item in devflow.evaluate_setup(self.repo)}
+        self.assertEqual(stages["roles"]["status"], "PASS")
+        self.assertEqual(
+            devflow.pending_execution_decisions(
+                devflow.load_json(self.repo / devflow.CONFIG_PATH),
+                devflow.load_json(self.repo / devflow.WORKFLOW_PATH),
+            ),
+            [],
+        )
+
+    def test_undecided_execution_cannot_preflight_or_record(self):
+        self.apply_init()
+        self.resolve_all_skill_decisions()
+        preflight = devflow.operate_preflight(self.repo, "implement")
+        self.assertEqual(preflight["status"], "BLOCKED")
+        self.assertTrue(any("не выбран" in gap for gap in preflight["external_gaps"]))
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "implement", "PASS", head, "ISSUE-1", "PR-1",
+                ["passing targeted tests=ci://run/1", "implementation diff=git://diff",
+                 "updated architecture docs when required=n/a"],
+                "codex", "some-model", "high", [],
+            )
+        self.assertIn("не выбран", str(context.exception))
+
+    def test_unresolved_agent_forbids_a_decided_model(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["model"] = {"mode": "explicit", "value": "some-model"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("агент не выбран" in item for item in errors))
+
+    def test_neutral_template_does_not_replace_a_configured_project_on_upgrade(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code", model=None, effort="high")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "keep"))
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(config["roles"]["implementer"]["agent"], "claude-code")
+        self.assertEqual(config["roles"]["implementer"]["effort"], {"mode": "explicit", "value": "high"})
 
 
 if __name__ == "__main__":

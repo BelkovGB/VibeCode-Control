@@ -94,6 +94,7 @@ Every `model` and `effort` parameter in `.agent-flow/config.json`, under `roles.
 - `{"mode": "inherited"}` — resolved by the client at run time; observe and record the actual value, never invent it;
 - `{"mode": "unset"}` — deliberately absent; never materialize it into a concrete value;
 - `{"mode": "not-applicable"}` — the role executes no model (agent `human`, `script`, `deterministic`).
+- `{"mode": "undecided"}` — nobody has chosen yet. The neutral template ships this state; it blocks the `roles` setup stage, node preflight and any delivery `PASS` until the owner decides.
 
 A bare string is the legacy spelling. It is accepted on read and normalized on write—a concrete value to explicit, `inherit` to inherited, `not-applicable` to not-applicable, `unset` or `unconfigured` to unset—and reported as a validation warning naming the exact pointers. `config.schema.json` defines this as `$defs.typedParameter` (explicit object, mode-only object, or legacy string) and declares `node_overrides`; `schema_version` stays `1`. A role whose agent executes no model must use not-applicable for both `model` and `effort`; an executing agent must not. A missing `model` or `effort` key is an error: write `{"mode": "unset"}` explicitly instead of letting a default appear. A declared `inherited` or `unset` mode does not warn and does not degrade preflight — it is a decision, not a gap. It is enforced at `run record`, which refuses a `PASS` unless the actually observed value is supplied.
 
