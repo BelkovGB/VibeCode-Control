@@ -51,7 +51,11 @@
       "competencies": ["issue decomposition", "acceptance criteria", "risk classification"],
       "inputs": ["roadmap", "architecture", "product rules"],
       "expected_evidence": ["ready issue", "acceptance-to-check map", "architecture impact decision"],
-      "checks": ["definition of ready", "one issue one branch one PR"],
+      "checks": [
+        "definition of ready",
+        "one issue one branch one PR",
+        "scope covers one feature or an explicitly bounded small batch in one place"
+      ],
       "timeout_minutes": 45
     },
     {

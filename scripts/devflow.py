@@ -1332,7 +1332,7 @@ def pending_execution_decisions(config: Any, workflow: Any = None) -> list[dict[
                 pending.append({
                     "pointer": f"roles.{role}.{field}",
                     "decision": f"Выберите {field} или явно объявите отсутствие параметра",
-                    "command": f"devflow model set {role} <model|inherit|unset>",
+                    "command": f"devflow model set {role} <model|inherit|unset|not-applicable>",
                 })
     overrides = config.get("node_overrides")
     if isinstance(overrides, dict):
@@ -1348,7 +1348,7 @@ def pending_execution_decisions(config: Any, workflow: Any = None) -> list[dict[
                     pending.append({
                         "pointer": f"node_overrides.{node_id}.{field}",
                         "decision": f"Выберите {field} для узла или снимите override",
-                        "command": f"devflow model set {node_id} <model|inherit|unset>",
+                        "command": f"devflow model set {node_id} <model|inherit|unset|not-applicable>",
                     })
     return pending
 
