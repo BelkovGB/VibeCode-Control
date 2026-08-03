@@ -17,7 +17,9 @@
           "enum": ["unassessed", "hypothesis-research", "product-definition", "development-readiness", "development", "maintenance"]
         },
         "decision_ref": {"type": "string"},
-        "repository_type": {"type": "string"}
+        "repository_type": {"type": "string"},
+        "scale": {"$ref": "#/$defs/projectScale"},
+        "scale_profiles": {"type": "object"}
       },
       "additionalProperties": true
     },
@@ -80,6 +82,28 @@
   },
   "additionalProperties": true,
   "$defs": {
+    "projectScale": {
+      "title": "Project scale profile",
+      "description": "Which scale profile this project declares. The profile carries a complexity budget the CLI prints but never measures, and gate defaults the CLI does compare. Choosing a scale is a PM decision, so `explicit` always names the decision that authorized it — including the first choice — and changing the profile under the same reference is refused as a silent rescale. `undecided` is what the neutral template ships and blocks the context setup stage.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode", "value", "decision_ref"],
+          "properties": {
+            "mode": {"const": "explicit"},
+            "value": {"type": "string", "minLength": 1},
+            "decision_ref": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {"mode": {"const": "undecided"}},
+          "additionalProperties": false
+        }
+      ]
+    },
     "sessionTransport": {
       "title": "Session transport registry",
       "description": "Which pre-created chat session executes which role. Sessions are a transport, not a source of truth: the CLI never sees them, so this records what the owner declared. `undecided` is what the neutral template ships and blocks setup; `not-applicable` is a decision that this project runs no sessions. Under `explicit` the client must be an adapter that declares `session_messaging`, and every role name must exist in `config.roles`.",

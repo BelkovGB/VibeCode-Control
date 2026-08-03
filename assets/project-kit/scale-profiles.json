@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "prototype": {
+      "audience": "the author, checking a hypothesis",
+      "promotion_watch": true,
+      "complexity_budget": {
+        "limits": {"services": 1, "external_dependencies": 3},
+        "rationale": "Throwaway work: a cut corner is marked, not hidden, and nothing here is meant to become production."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "unmeasured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": false,
+        "github.required_checks_minimum": 0
+      }
+    },
+    "personal": {
+      "audience": "the author and people close to them",
+      "complexity_budget": {
+        "limits": {"services": 1, "external_dependencies": 5},
+        "rationale": "One process, one deployment; a second service has to earn its place."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "measured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": true,
+        "github.required_checks_minimum": 1
+      }
+    },
+    "internal-tool": {
+      "audience": "colleagues or one team",
+      "complexity_budget": {
+        "limits": {"services": 2, "external_dependencies": 8},
+        "rationale": "A monolith or a pair of services; sensitive data is possible, so access and secrets are part of the design."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "measured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": true,
+        "github.required_checks_minimum": 2
+      }
+    },
+    "startup": {
+      "audience": "external users",
+      "complexity_budget": {
+        "limits": {"services": 3, "external_dependencies": 12},
+        "rationale": "Managed services and pragmatic dependencies beat self-hosted infrastructure until the load proves otherwise."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "measured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": true,
+        "github.required_checks_minimum": 3
+      }
+    },
+    "oss-library": {
+      "audience": "external developers",
+      "complexity_budget": {
+        "limits": {"services": 0, "external_dependencies": 3},
+        "rationale": "Every dependency becomes the consumer's dependency, and the public API is a promise under semver."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "measured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": true,
+        "github.required_checks_minimum": 3
+      }
+    },
+    "corporate": {
+      "audience": "a business customer",
+      "complexity_budget": {
+        "limits": {"services": 5, "external_dependencies": 15},
+        "rationale": "Company standards decide the shape; deviation from them is an architecture decision with a record."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "measured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": true,
+        "github.required_checks_minimum": 4
+      }
+    },
+    "regulated": {
+      "audience": "users and a regulator",
+      "complexity_budget": {
+        "limits": {"services": 5, "external_dependencies": 10},
+        "rationale": "Only mature components: an unaudited dependency is a compliance finding, not a technical preference."
+      },
+      "gate_defaults": {
+        "quality.baseline_status": "measured",
+        "policy.max_fix_cycles": 2,
+        "policy.tdd_for_behavior_changes": true,
+        "github.required_checks_minimum": 5
+      }
+    }
+  }
+}

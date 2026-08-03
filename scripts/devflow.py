@@ -161,6 +161,22 @@ WORKSPACE_PERMISSIONS = ("changes", "dependencies", "tests")
 SESSION_MODES = {MODE_EXPLICIT, MODE_NOT_APPLICABLE, MODE_UNDECIDED}
 SESSION_PROMPTS_DIR = f"{META_DIR}/prompts"
 SESSION_ASSIGNMENT_TEMPLATE = f"{SESSION_PROMPTS_DIR}/session-assignment.md"
+SCALE_PROFILES_PATH = f"{META_DIR}/scale-profiles.json"
+SCALE_MODES = {MODE_EXPLICIT, MODE_UNDECIDED}
+# What a scale profile may propose.  The list is the whole reach of a profile: a key
+# outside it is a validation error, so the non-minimizable core is out of reach by
+# construction rather than by promise.  Scale sets defaults for proposals; it never
+# touches what a gate is trusted for.
+SCALE_GATE_DEFAULT_KEYS = (
+    "quality.baseline_status",
+    "policy.max_fix_cycles",
+    "policy.tdd_for_behavior_changes",
+    "github.required_checks_minimum",
+)
+SCALE_BUDGET_NOTE = (
+    "Бюджет сложности объявлен профилем и не измеряется CLI: предложение обязано "
+    "на него ссылаться, проверяет это ревьюер."
+)
 SESSION_LIVENESS_NOTE = (
     "Реестр объявлен владельцем. CLI сессий не видит: жива ли сессия сейчас, "
     "прочитала ли она постановку и тот ли это чат — локально не проверяется."
@@ -491,7 +507,7 @@ def plan_path_allowed(mode: str, relative: str) -> bool:
     if any(part.lower() == ".git" for part in parts):
         return False
     setup_exact = {
-        CONFIG_PATH, WORKFLOW_PATH, SKILLS_LOCK_PATH, SETUP_STAGES_PATH,
+        CONFIG_PATH, WORKFLOW_PATH, SKILLS_LOCK_PATH, SETUP_STAGES_PATH, SCALE_PROFILES_PATH,
         f"{META_DIR}/config.schema.json", f"{META_DIR}/workflow.schema.json",
         f"{META_DIR}/devflow.py", "AGENTS.md", "CLAUDE.md", ".gitignore",
         ".github/pull_request_template.md", ".github/ISSUE_TEMPLATE/devflow-task.yml",
@@ -873,6 +889,7 @@ def build_setup_plan(repo: Path, mode: str, purpose: str = "setup") -> dict[str,
             add(relative, data)
     for relative, data in {
         SETUP_STAGES_PATH: (kit / "setup-stages.json").read_bytes(),
+        SCALE_PROFILES_PATH: (kit / "scale-profiles.json").read_bytes(),
         f"{META_DIR}/config.schema.json": (kit / "config.schema.json").read_bytes(),
         f"{META_DIR}/workflow.schema.json": (kit / "workflow.schema.json").read_bytes(),
     }.items():
@@ -1766,6 +1783,11 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
                 _, role_errors = parse_workspace_role(
                     declared_workspaces[role], f"automation.workspaces.{role}")
                 errors.extend(role_errors)
+    project_block = config.get("project") if isinstance(config.get("project"), dict) else {}
+    _, scale_errors = parse_scale(project_block.get("scale"))
+    errors.extend(scale_errors)
+    if "scale_profiles" in project_block and not isinstance(project_block["scale_profiles"], dict):
+        errors.append("project.scale_profiles должен быть объектом")
     errors.extend(session_transport_errors(config))
     plan = validation_plan_of(config)
     if not isinstance(config.get("quality", {}).get("validation_plan", {}), dict):
@@ -3047,11 +3069,17 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
             "Report language is not chosen; the template ships no default: "
             "devflow config set policy.language <language>"
         )
+    scale = scale_report(repo, config)
+    context_evidence.append(f"scale={scale['profile'] or scale['mode']}")
+    context_gaps.extend(scale["errors"])
+    context_gaps.extend(f"{item['pointer']}: {item['decision']}" for item in scale["pending"])
     context_status = "BLOCKED" if context_gaps else "PASS"
     results.append(stage_result(
         "context", context_status, context_evidence, context_gaps,
-        "Record the current product stage and the explicit PM decision; do not infer approval.",
-        following("context"), "devflow config set project.product_stage <stage>", bool(context_gaps)
+        "Record the current product stage, the project scale, and the explicit PM decision behind each; do not infer approval.",
+        following("context"),
+        scale["pending"][0]["command"] if scale["pending"] else "devflow config set project.product_stage <stage>",
+        bool(context_gaps)
     ))
 
     # An undecided parameter blocks this stage through an explicit typed marker, not
@@ -3284,6 +3312,62 @@ def mark_skill_revalidation(config: dict[str, Any], workflow: dict[str, Any], lo
             lock["node_decisions"][node_id]["revalidation_required"] = True
 
 
+def scale_write_errors(repo: Path, previous: dict[str, Any], updated: dict[str, Any]) -> list[str]:
+    """Rules that need the profile table and the previous value, so not shape alone.
+
+    Three cases that must not collapse, the same discipline the chain budget learned:
+    the same reference with the same profile is silence, the same reference with a
+    different profile is a silent rescale and is refused, and a new reference writes.
+    """
+    entry, errors = parse_scale(
+        (updated.get("project") if isinstance(updated.get("project"), dict) else {}).get("scale")
+    )
+    if errors:
+        return errors
+    registry = scale_profile_registry(repo, updated)
+    registry_errors = scale_profile_errors(registry)
+    if registry_errors:
+        return registry_errors
+    if entry["mode"] != MODE_EXPLICIT:
+        return []
+    if entry["value"] not in registry:
+        return [
+            f"project.scale.value: неизвестный профиль {entry['value']}; известны: "
+            + ", ".join(sorted(registry))
+            + "; собственный профиль объявляется блоком project.scale_profiles"
+        ]
+    before = scale_of(previous)
+    if (
+        before.get("mode") == MODE_EXPLICIT
+        and before.get("decision_ref") == entry.get("decision_ref")
+        and before.get("value") != entry.get("value")
+    ):
+        return [
+            "Масштаб изменён без нового решения — укажите новый decision_ref. "
+            f"Записано было {before.get('value')} по решению {before.get('decision_ref')}, "
+            f"запрошено {entry['value']}"
+        ]
+    return []
+
+
+def scale_set(repo: Path, profile: str, decision_ref: str) -> dict[str, Any]:
+    """Rescale is an operation, not an edit: the command that changes the scale is the
+    honest place to demand the decision that authorizes it."""
+    name = profile.strip() if isinstance(profile, str) else ""
+    reference = decision_ref.strip() if isinstance(decision_ref, str) else ""
+    if not name:
+        raise DevflowError("Укажите профиль масштаба")
+    if not reference:
+        raise DevflowError(
+            "Масштаб проекта выбирается решением PM: передайте --decision-ref <ref>"
+        )
+    result = configure_value(repo, "project.scale", json.dumps(
+        {"mode": MODE_EXPLICIT, "value": name, "decision_ref": reference}
+    ))
+    result["scale"] = scale_report(repo, load_json(repo / CONFIG_PATH))
+    return result
+
+
 def configure_value(repo: Path, dotted: str, raw: str) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     previous_config = copy.deepcopy(config)
@@ -3303,6 +3387,9 @@ def configure_value(repo: Path, dotted: str, raw: str) -> dict[str, Any]:
         raise DevflowError(
             "Изменение конфигурации ломает граф: " + "; ".join(introduced)
         )
+    scale_errors = scale_write_errors(repo, previous_config, config)
+    if scale_errors:
+        raise DevflowError("; ".join(scale_errors))
     if dotted.startswith("roles.") or dotted.startswith("node_overrides.") or dotted.startswith("models."):
         parts = dotted.split(".")
         target = parts[1] if len(parts) > 1 else ""
@@ -4171,6 +4258,7 @@ def doctor(repo: Path, deep: bool = False, refresh_skills: bool = False, repair_
     findings.append(managed_block_report(repo))
     findings.append(workspace_report(repo, config))
     findings.append(session_report(repo, config, workflow))
+    findings.append(scale_report(repo, config))
 
     due = []
     today = utc_now().date()
@@ -4378,6 +4466,12 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
         "node": effective,
         "effective_configuration": effective_configuration(workflow, config, lock),
         "cycle_budget": budget,
+        # Project-level context, printed for every node rather than guessed for the two
+        # that consume it today: a node that starts consuming it needs no engine change.
+        "scale": {
+            key: value for key, value in scale_report(repo, config).items()
+            if key in {"mode", "profile", "decision_ref", "budget", "budget_note", "findings"}
+        },
         "transport": transport,
         "self_modification": guarded_control_plane_changes(repo),
         "required_artifacts": evidence_contract_for(nodes[node_id]),
@@ -4993,6 +5087,118 @@ def workspace_report(repo: Path, config: Any) -> dict[str, Any]:
             "findings": findings, "pending": pending}
 
 
+def scale_profile_registry(repo: Path, config: Any = None) -> dict[str, dict[str, Any]]:
+    """The shipped profiles, extended by an optional project block.
+
+    Kit data rather than an engine constant, because the table is a product decision a
+    project may extend; installed as a file so `upgrade` refreshes it, extended through
+    the configuration so a project's own profile survives that refresh.
+    """
+    installed = repo / SCALE_PROFILES_PATH
+    source = installed if installed.is_file() else find_project_kit(repo) / "scale-profiles.json"
+    data = load_json(source) if source.is_file() else {}
+    profiles = data.get("profiles") if isinstance(data, dict) else {}
+    registry = copy.deepcopy(profiles) if isinstance(profiles, dict) else {}
+    project = config.get("project") if isinstance(config, dict) else None
+    extension = project.get("scale_profiles") if isinstance(project, dict) else None
+    if isinstance(extension, dict):
+        for name, profile in extension.items():
+            if not isinstance(name, str) or not isinstance(profile, dict):
+                continue
+            merged = dict(registry.get(name, {}))
+            merged.update(profile)
+            registry[name] = merged
+    return registry
+
+
+def scale_profile_errors(registry: dict[str, dict[str, Any]]) -> list[str]:
+    """Shape of the profile table, checked on the merged registry.
+
+    A project may add profiles and override shipped ones — that is its risk decision —
+    but no custom profile reaches further than a canonical one, so the allowlist is
+    applied here rather than to the shipped file.
+    """
+    errors: list[str] = []
+    for name in sorted(registry):
+        profile = registry[name]
+        pointer = f"scale-profiles.{name}"
+        if not isinstance(profile, dict):
+            errors.append(f"{pointer} должен быть объектом")
+            continue
+        unknown = sorted(set(profile) - {"audience", "promotion_watch", "complexity_budget", "gate_defaults"})
+        if unknown:
+            errors.append(f"{pointer} содержит неизвестные ключи: {', '.join(unknown)}")
+        if "promotion_watch" in profile and not isinstance(profile["promotion_watch"], bool):
+            errors.append(f"{pointer}.promotion_watch должен быть булевым")
+        budget = profile.get("complexity_budget")
+        if not isinstance(budget, dict):
+            errors.append(f"{pointer}.complexity_budget обязателен и должен быть объектом")
+        else:
+            limits = budget.get("limits")
+            if not isinstance(limits, dict) or not limits or not all(
+                isinstance(value, int) and value >= 0 for value in limits.values()
+            ):
+                errors.append(f"{pointer}.complexity_budget.limits обязателен: непустые целые пределы")
+            if not isinstance(budget.get("rationale"), str) or not budget["rationale"].strip():
+                errors.append(f"{pointer}.complexity_budget.rationale обязателен: предел объясняется")
+        defaults = profile.get("gate_defaults")
+        if not isinstance(defaults, dict):
+            errors.append(f"{pointer}.gate_defaults обязателен и должен быть объектом")
+            continue
+        for key in sorted(set(defaults) - set(SCALE_GATE_DEFAULT_KEYS)):
+            errors.append(
+                f"{pointer}.gate_defaults.{key}: профиль масштаба не управляет этим параметром; "
+                "допустимы: " + ", ".join(SCALE_GATE_DEFAULT_KEYS)
+            )
+    return errors
+
+
+def parse_scale(raw: Any, pointer: str = "project.scale") -> tuple[dict[str, Any], list[str]]:
+    """Parse the declared project scale.  Two modes: chosen, or nobody chose yet."""
+    errors: list[str] = []
+    if raw is None:
+        return {"mode": MODE_UNDECIDED}, errors
+    if not isinstance(raw, dict):
+        return {"mode": MODE_UNDECIDED}, [f"{pointer} должен быть объектом с полем mode"]
+    unknown = sorted(set(raw) - {"mode", "value", "decision_ref"})
+    if unknown:
+        errors.append(f"{pointer} содержит неизвестные ключи: {', '.join(unknown)}")
+    mode = raw.get("mode")
+    if mode not in SCALE_MODES:
+        return {"mode": MODE_UNDECIDED}, errors + [
+            f"{pointer}.mode должен быть одним из: " + ", ".join(sorted(SCALE_MODES))
+        ]
+    if mode != MODE_EXPLICIT:
+        for field in ("value", "decision_ref"):
+            if raw.get(field) is not None:
+                errors.append(f"{pointer}.{field} недопустим при mode={mode}")
+        return {"mode": mode}, errors
+    entry: dict[str, Any] = {"mode": MODE_EXPLICIT}
+    value = raw.get("value")
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{pointer}.value обязателен и непуст при mode={MODE_EXPLICIT}")
+    else:
+        entry["value"] = value.strip()
+    reference = raw.get("decision_ref")
+    if not isinstance(reference, str) or not reference.strip():
+        # Choosing a scale is a PM decision, including the first time: a profile without
+        # a named decision would be a default nobody approved.
+        errors.append(
+            f"{pointer}.decision_ref обязателен и непуст при mode={MODE_EXPLICIT}: "
+            "выбор масштаба — решение PM, а не умолчание"
+        )
+    else:
+        entry["decision_ref"] = reference.strip()
+    return entry, errors
+
+
+def scale_of(config: Any) -> dict[str, Any]:
+    project = config.get("project") if isinstance(config, dict) else {}
+    project = project if isinstance(project, dict) else {}
+    entry, _ = parse_scale(project.get("scale"))
+    return entry
+
+
 def parse_session_role(raw: Any, pointer: str) -> tuple[dict[str, Any], list[str]]:
     """Parse one role → session binding."""
     errors: list[str] = []
@@ -5195,6 +5401,138 @@ def pending_session_decisions(config: Any, workflow: Any) -> list[dict[str, str]
     return pending
 
 
+def scale_strictness(key: str, value: Any) -> int | None:
+    """One comparable rank per gate default, so "stricter" is a fact, not a feeling."""
+    if key == "quality.baseline_status":
+        return {"unmeasured": 0, "measured": 1}.get(value)
+    if key == "policy.max_fix_cycles":
+        # A larger correction budget is the looser setting, so the rank is inverted.
+        return -value if isinstance(value, int) else None
+    if key == "policy.tdd_for_behavior_changes":
+        return int(value) if isinstance(value, bool) else None
+    if key == "github.required_checks_minimum":
+        return value if isinstance(value, int) else None
+    return None
+
+
+def scale_actual_value(config: Any, key: str) -> Any:
+    config = config if isinstance(config, dict) else {}
+
+    def block(name: str) -> dict[str, Any]:
+        value = config.get(name)
+        return value if isinstance(value, dict) else {}
+
+    if key == "quality.baseline_status":
+        return block("quality").get("baseline_status")
+    if key == "policy.max_fix_cycles":
+        return block("policy").get("max_fix_cycles")
+    if key == "policy.tdd_for_behavior_changes":
+        return block("policy").get("tdd_for_behavior_changes")
+    if key == "github.required_checks_minimum":
+        checks = block("github").get("required_checks")
+        return len(checks) if isinstance(checks, list) else 0
+    return None
+
+
+def scale_gate_comparison(config: Any, defaults: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    defaults = defaults if isinstance(defaults, dict) else {}
+    for key in SCALE_GATE_DEFAULT_KEYS:
+        if key not in defaults:
+            continue
+        expected = defaults[key]
+        actual = scale_actual_value(config, key)
+        expected_rank = scale_strictness(key, expected)
+        actual_rank = scale_strictness(key, actual)
+        if expected_rank is None or actual_rank is None:
+            verdict = "unknown"
+        elif actual_rank < expected_rank:
+            verdict = "weaker"
+        elif actual_rank > expected_rank:
+            verdict = "stricter"
+        else:
+            verdict = "match"
+        rows.append({"key": key, "expected": expected, "actual": actual, "verdict": verdict})
+    return rows
+
+
+def scale_report(repo: Path, config: Any) -> dict[str, Any]:
+    """The declared scale, what it proposes, and what it deliberately does not measure."""
+    entry = scale_of(config)
+    registry = scale_profile_registry(repo, config)
+    errors = scale_profile_errors(registry)
+    _, shape_errors = parse_scale(
+        (config.get("project") if isinstance(config, dict) else {} or {}).get("scale")
+        if isinstance(config, dict) else None
+    )
+    errors = errors + shape_errors
+    report: dict[str, Any] = {
+        "check": "scale",
+        "mode": entry["mode"],
+        "profile": entry.get("value"),
+        "decision_ref": entry.get("decision_ref"),
+        "known_profiles": sorted(registry),
+        "errors": errors,
+        "findings": [],
+        "gates": [],
+        "budget": None,
+        "budget_note": SCALE_BUDGET_NOTE,
+        "pending": [],
+    }
+    if entry["mode"] != MODE_EXPLICIT:
+        report["status"] = "BLOCKED" if errors else "PARTIAL"
+        report["pending"] = [{
+            "pointer": "project.scale",
+            "decision": "Выберите профиль масштаба проекта: он задаёт бюджет сложности и дефолты гейтов",
+            "command": "devflow scale set <profile> --decision-ref <ref>",
+        }]
+        return report
+    profile = registry.get(entry["value"])
+    if not isinstance(profile, dict):
+        report["status"] = "BLOCKED"
+        report["errors"] = errors + [
+            f"project.scale.value: неизвестный профиль {entry['value']}; известны: "
+            + ", ".join(sorted(registry))
+        ]
+        return report
+    report["budget"] = profile.get("complexity_budget")
+    report["audience"] = profile.get("audience")
+    report["promotion_watch"] = bool(profile.get("promotion_watch"))
+    rows = scale_gate_comparison(config, profile.get("gate_defaults"))
+    report["gates"] = rows
+    findings: list[str] = []
+    proposals: list[dict[str, str]] = []
+    for row in rows:
+        if row["verdict"] != "weaker":
+            continue
+        findings.append(
+            f"{row['key']}: фактическое значение {row['actual']} слабее дефолта профиля "
+            f"{entry['value']} ({row['expected']})"
+        )
+        # A default is a proposal, never a silent write: the owner applies it with the
+        # ordinary plan-and-diff command, and the profile only says what it would be.
+        if row["key"] == "github.required_checks_minimum":
+            command = "devflow config set github.required_checks '[\"<check>\", ...]'"
+        else:
+            command = f"devflow config set {row['key']} {json.dumps(row['expected'])}"
+        proposals.append({"pointer": row["key"], "command": command})
+    report["proposals"] = proposals
+    if report["promotion_watch"]:
+        # A throwaway profile must not quietly grow into a production system: a
+        # configuration that is permanently stricter is a scale change, and the profile
+        # asks for it by carrying the flag — the engine never matches the profile name.
+        raised = [row["key"] for row in rows if row["verdict"] == "stricter"]
+        if raised:
+            findings.append(
+                f"Профиль {entry['value']} помечен promotion_watch, а конфигурация строже его "
+                f"дефолтов ({', '.join(raised)}): проект перерос профиль — зафиксируйте rescale "
+                "через `devflow scale set <profile> --decision-ref <ref>`"
+            )
+    report["findings"] = findings
+    report["status"] = "BLOCKED" if errors else ("PARTIAL" if findings else "PASS")
+    return report
+
+
 def session_report(repo: Path, config: Any, workflow: Any) -> dict[str, Any]:
     """What the declared session registry says — and what it cannot prove."""
     del repo
@@ -5390,7 +5728,18 @@ def session_assign(repo: Path, node: str, issue: str, change_type: str = "",
                             f"recorded as `{name}=<kind>:<reference>`")
         else:
             expected.append(f"- `{name}`")
+    scale = scale_report(repo, config)
+    budget = scale.get("budget") if isinstance(scale.get("budget"), dict) else None
+    if budget:
+        limits = ", ".join(f"{name} ≤ {value}" for name, value in sorted(budget["limits"].items()))
+        budget_text = (
+            f"`{scale['profile']}` — {limits}. {budget['rationale']} "
+            "This budget is declared, not measured by the CLI: the proposal has to reference it."
+        )
+    else:
+        budget_text = f"not declared (project scale is `{scale['mode']}`)"
     text = render_session_assignment(session_assignment_template(repo), {
+        "complexity_budget": budget_text,
         "session": str(resolved["session"]),
         "role": str(resolved["role"]),
         "node": node,
@@ -5956,6 +6305,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference to the PM decision that authorizes continuing past a spent cycle budget",
     )
 
+    scale = sub.add_parser("scale", help="Project scale profile: complexity budget and gate defaults")
+    scale_sub = scale.add_subparsers(dest="scale_command", required=True)
+    scale_sub.add_parser("show", help="Report the declared profile, its budget and gate drift")
+    scale_set_parser = scale_sub.add_parser("set", help="Choose or change the profile; both need a PM decision")
+    scale_set_parser.add_argument("profile")
+    scale_set_parser.add_argument(
+        "--decision-ref", default="", metavar="REF",
+        help="Reference to the PM decision that chooses or changes the scale",
+    )
+
     session = sub.add_parser("session", help="Session transport: registry state and node assignments")
     session_sub = session.add_subparsers(dest="session_command", required=True)
     session_sub.add_parser("check", help="Report the declared session registry and what it cannot prove")
@@ -6270,6 +6629,14 @@ def execute(args: argparse.Namespace) -> int:
         result = operate_preflight(repo, args.node, args.issue, args.human_decision, args.change_type)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
+    if args.command == "scale":
+        if args.scale_command == "show":
+            report = scale_report(repo, load_json(repo / CONFIG_PATH))
+            print_json(report)
+            return 0 if report["status"] == "PASS" else 1
+        if args.scale_command == "set":
+            print_json(scale_set(repo, args.profile, args.decision_ref))
+            return 0
     if args.command == "session":
         if args.session_command == "check":
             config, workflow, _ = load_project_state(repo)

@@ -15,6 +15,8 @@ Run the preflight first and stop unless it returns `PASS`:
 
 Report `PARTIAL` or `BLOCKED` rather than inventing executor, model, effort, skill, GitHub, or CI availability. Load `devflow-node` explicitly, then every skill the preflight names as assigned to this node.
 
+Complexity budget: {{complexity_budget}}
+
 Expected evidence for this node:
 
 {{expected_evidence}}

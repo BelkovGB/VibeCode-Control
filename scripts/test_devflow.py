@@ -2264,6 +2264,9 @@ class DevflowTestCase(unittest.TestCase):
         config["project"]["decision_ref"] = "PM-1"
         config["policy"]["language"] = "en"
         devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        # The context stage now also holds the scale decision, so clearing it takes one
+        # more explicit choice before setup moves on.
+        devflow.scale_set(self.repo, "internal-tool", "PM-2")
         step = devflow.next_setup_step(devflow.evaluate_setup(self.repo), self.repo)
         self.assertEqual(step["stage"], "roles")
         self.assertEqual(step["status"], "BLOCKED")
@@ -2554,6 +2557,179 @@ class DevflowTestCase(unittest.TestCase):
             devflow.session_assign(self.repo, "implement", "#17", pm_go="PM-77")["status"], "PASS")
         devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "test-upgrade"))
         self.assertTrue((self.repo / devflow.SESSION_ASSIGNMENT_TEMPLATE).is_file())
+
+    # --- scale profiles ---------------------------------------------------------------
+
+    def test_kit_chooses_no_scale_and_context_asks_with_the_command(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertEqual(config["project"]["scale"], {"mode": "undecided"})
+        self.apply_init()
+        stage = next(item for item in devflow.evaluate_setup(self.repo)
+                     if item["stage"] == "context")
+        self.assertEqual(stage["status"], "BLOCKED")
+        self.assertTrue(any("project.scale" in gap for gap in stage["gaps"]))
+        self.assertIn("scale=undecided", stage["evidence"])
+        report = devflow.scale_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertEqual(report["pending"][0]["command"],
+                         "devflow scale set <profile> --decision-ref <ref>")
+
+    def test_profiles_are_kit_data_that_upgrade_refreshes(self):
+        kit = devflow.find_project_kit(self.repo)
+        shipped = devflow.load_json(kit / "scale-profiles.json")["profiles"]
+        self.assertEqual(sorted(shipped), [
+            "corporate", "internal-tool", "oss-library", "personal", "prototype",
+            "regulated", "startup",
+        ])
+        self.apply_init()
+        installed = self.repo / devflow.SCALE_PROFILES_PATH
+        self.assertTrue(installed.is_file())
+        installed.write_text(json.dumps({"schema_version": 1, "profiles": {}}), encoding="utf-8")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "refresh"))
+        self.assertEqual(sorted(devflow.load_json(installed)["profiles"]), sorted(shipped))
+
+    def test_a_project_may_add_and_override_profiles_but_not_reach_further(self):
+        self.apply_init()
+        devflow.configure_value(self.repo, "project.scale_profiles", json.dumps({
+            "throwaway": {
+                "audience": "one afternoon",
+                "promotion_watch": True,
+                "complexity_budget": {"limits": {"services": 1}, "rationale": "One sitting."},
+                "gate_defaults": {"policy.tdd_for_behavior_changes": False},
+            },
+            "startup": {"audience": "our own definition of startup",
+                        "complexity_budget": {"limits": {"services": 9}, "rationale": "Ours."},
+                        "gate_defaults": {"policy.max_fix_cycles": 3}},
+        }))
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        registry = devflow.scale_profile_registry(self.repo, config)
+        self.assertIn("throwaway", registry)
+        self.assertEqual(registry["startup"]["audience"], "our own definition of startup")
+        self.assertEqual(devflow.scale_profile_errors(registry), [])
+        # The allowlist applies to the merged registry, so a custom profile reaches no
+        # further than a canonical one.
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.configure_value(self.repo, "project.scale_profiles", json.dumps({
+                "greedy": {
+                    "complexity_budget": {"limits": {"services": 1}, "rationale": "x"},
+                    "gate_defaults": {"automation.pipeline": {"mode": "count"}},
+                },
+            }))
+        self.assertIn("не управляет этим параметром", str(context.exception))
+
+    def test_a_scale_profile_cannot_reach_the_non_minimizable_core(self):
+        core_pointers = {
+            "automation.pipeline", "quality.validation_plan", "github.required_checks",
+            "policy.max_fix_cycles_decision_ref",
+        }
+        self.assertEqual(set(devflow.SCALE_GATE_DEFAULT_KEYS) & core_pointers, set())
+        for name in devflow.MERGE_GATE_INVARIANTS | devflow.NON_MINIMIZABLE_GATE_KINDS:
+            self.assertFalse(any(name in key for key in devflow.SCALE_GATE_DEFAULT_KEYS), name)
+        # Reachability is refused by construction, not by the profiles happening to
+        # behave: every key outside the allowlist is a validation error.
+        for pointer in sorted(core_pointers):
+            registry = {"x": {"complexity_budget": {"limits": {"services": 1}, "rationale": "x"},
+                              "gate_defaults": {pointer: True}}}
+            self.assertTrue(any("не управляет этим параметром" in item
+                                for item in devflow.scale_profile_errors(registry)), pointer)
+
+    def test_choosing_and_changing_the_scale_both_need_a_named_decision(self):
+        self.apply_init()
+        with self.assertRaises(devflow.DevflowError) as missing:
+            devflow.scale_set(self.repo, "startup", "")
+        self.assertIn("--decision-ref", str(missing.exception))
+        devflow.scale_set(self.repo, "startup", "PM-42")
+        self.assertEqual(
+            devflow.scale_of(devflow.load_json(self.repo / devflow.CONFIG_PATH)),
+            {"mode": "explicit", "value": "startup", "decision_ref": "PM-42"})
+        with self.assertRaises(devflow.DevflowError) as silent:
+            devflow.scale_set(self.repo, "regulated", "PM-42")
+        self.assertIn("без нового решения", str(silent.exception))
+        # The identical repeat is not a change, so it is not refused.
+        devflow.scale_set(self.repo, "startup", "PM-42")
+        devflow.scale_set(self.repo, "regulated", "PM-51")
+        self.assertEqual(
+            devflow.scale_of(devflow.load_json(self.repo / devflow.CONFIG_PATH))["value"],
+            "regulated")
+        with self.assertRaises(devflow.DevflowError) as unknown:
+            devflow.scale_set(self.repo, "enterprise-grade", "PM-52")
+        self.assertIn("неизвестный профиль", str(unknown.exception))
+
+    def test_doctor_reports_a_configuration_weaker_than_the_profile_with_commands(self):
+        self.apply_init()
+        devflow.scale_set(self.repo, "regulated", "PM-51")
+        report = devflow.scale_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertEqual(report["status"], "PARTIAL")
+        self.assertTrue(any("quality.baseline_status" in item for item in report["findings"]))
+        self.assertIn("devflow config set quality.baseline_status \"measured\"",
+                      [item["command"] for item in report["proposals"]])
+        finding = next(item for item in devflow.doctor(self.repo)["diagnosis"]
+                       if item["check"] == "scale")
+        self.assertEqual(finding["profile"], "regulated")
+
+    def test_promotion_watch_is_a_flag_in_the_data_not_a_name_in_the_code(self):
+        self.apply_init()
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["quality"]["baseline_status"] = "measured"
+        config["policy"]["tdd_for_behavior_changes"] = True
+        config["github"]["required_checks"] = ["unit", "lint"]
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        devflow.scale_set(self.repo, "prototype", "PM-1")
+        watched = devflow.scale_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertTrue(watched["promotion_watch"])
+        self.assertTrue(any("перерос профиль" in item for item in watched["findings"]))
+        # The very same configuration, the same profile name, the flag turned off:
+        # the engine reads the flag, it never compares the name. Clearing it takes an
+        # explicit `false` because the override merges key by key, like `clients`.
+        devflow.configure_value(self.repo, "project.scale_profiles", json.dumps({
+            "prototype": {
+                "audience": "the author",
+                "promotion_watch": False,
+                "complexity_budget": {"limits": {"services": 1}, "rationale": "Throwaway."},
+                "gate_defaults": {"quality.baseline_status": "unmeasured",
+                                  "policy.tdd_for_behavior_changes": False,
+                                  "github.required_checks_minimum": 0},
+            },
+        }))
+        unwatched = devflow.scale_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertFalse(unwatched["promotion_watch"])
+        self.assertEqual(unwatched["findings"], [])
+
+    def test_the_complexity_budget_reaches_the_node_that_consumes_it(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(agent="claude-code")
+        devflow.scale_set(self.repo, "personal", "PM-7")
+        preflight = devflow.operate_preflight(self.repo, "design", "#30")
+        self.assertEqual(preflight["scale"]["profile"], "personal")
+        self.assertEqual(preflight["scale"]["budget"]["limits"]["services"], 1)
+        self.assertIn("не измеряется CLI", preflight["scale"]["budget_note"])
+        self.declare_sessions(extra={"architect": {"mode": "explicit", "session": "arch-chat"}})
+        self.commit_fixture()
+        rendered = devflow.session_assign(self.repo, "design", "#30", pm_go="PM-7")
+        self.assertIn("services ≤ 1", rendered["assignment"])
+        self.assertIn("not measured by the CLI", rendered["assignment"])
+        review = next(node for node in
+                      devflow.load_json(self.repo / devflow.WORKFLOW_PATH)["nodes"]
+                      if node["id"] == "final_review")
+        self.assertTrue(any("declared project scale" in check for check in review["checks"]))
+
+    def test_a_project_installed_before_scale_degrades_instead_of_crashing(self):
+        self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        del config["project"]["scale"]
+        (self.repo / devflow.CONFIG_PATH).write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (self.repo / devflow.SCALE_PROFILES_PATH).unlink()
+        self.assertEqual(devflow.validate_config(config)[0], [])
+        report = devflow.scale_report(self.repo, config)
+        self.assertEqual(report["mode"], "undecided")
+        # The shipped data still answers, so nothing crashes before the migration.
+        self.assertIn("startup", report["known_profiles"])
+        self.assertEqual(next(item for item in devflow.doctor(self.repo)["diagnosis"]
+                              if item["check"] == "scale")["mode"], "undecided")
+        self.assertEqual(len(devflow.evaluate_setup(self.repo)), 11)
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "restore"))
+        self.assertTrue((self.repo / devflow.SCALE_PROFILES_PATH).is_file())
 
     # --- design node ------------------------------------------------------------------
 

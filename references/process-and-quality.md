@@ -54,6 +54,8 @@ An Issue is ready only if it contains:
 
 The architecture-impact decision is not made while writing the Issue. The graph has a `design` node between the scope gate and Issue preparation: the architect produces the design decision (an ADR when the architecture impact is real), the test specification, and the Issue draft, and Issue preparation packages that output. Its check requires the architecture-impact entry to reference the design artifact rather than to invent one, so the same decision is not taken twice in two places.
 
+Design is bounded by the declared project scale. `project.scale` names a profile whose complexity budget states what this project is allowed to be — a prototype gets one service, an OSS library counts every dependency as its consumers' dependency — and the budget travels with the node assignment so the proposal is made against it rather than judged after the fact. The budget is declared, not measured: `final_review` checks that the solution matches the declared scale, and a proposal that exceeds it has to justify the excess rather than hope nobody counts. A task's risk class may raise gates above the profile defaults; it may not lower them.
+
 Design produces a proposal, never a product decision. When designing surfaces a choice that the approved scope does not cover, the node routes to `human_needed` under `design.decision_required` — the same way the scope gate already routes an unapproved product question. There is no return edge into the scope gate: the PM answers, and the run starts again with an approved scope.
 
 Use one Issue, one branch, and one PR. Use `Closes #N` only for complete delivery and `Related to #N` for an explicitly accepted partial split.
