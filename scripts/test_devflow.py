@@ -1567,6 +1567,35 @@ class DevflowTestCase(unittest.TestCase):
         self.assertFalse(refused["allowed"])
         self.assertIn("без нового решения", refused["reason"])
 
+    def test_raising_the_budget_under_the_same_decision_is_refused_at_the_mutation(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        self.consume_chain_task("#31")
+        self.consume_chain_task("#32")
+        self.assertFalse(devflow.pipeline_check(self.repo)["allowed"])
+        before_state = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        before_config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        with self.assertRaises(devflow.DevflowError) as context:
+            self.set_pipeline_budget({"mode": "count", "value": 5, "decision_ref": "PM-1"})
+        self.assertIn("без нового решения", str(context.exception))
+        # Neither the state nor the configuration may move.
+        self.assertEqual(devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH), before_state)
+        self.assertEqual(devflow.load_json(self.repo / devflow.CONFIG_PATH), before_config)
+        self.assertFalse(devflow.pipeline_check(self.repo)["allowed"])
+
+    def test_repeating_the_same_budget_command_keeps_the_count(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 3, "decision_ref": "PM-1"})
+        self.consume_chain_task("#31")
+        before = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        self.assertEqual(devflow.pipeline_check(self.repo)["consumed_count"], 1)
+        self.set_pipeline_budget({"mode": "count", "value": 3, "decision_ref": "PM-1"})
+        after = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        self.assertEqual(after["started_at"], before["started_at"])
+        self.assertEqual(after["known_runs"], before["known_runs"])
+        self.assertEqual(devflow.pipeline_check(self.repo)["consumed_count"], 1)
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 2)
+
     def test_a_new_decision_starts_the_count_again(self):
         self.apply_init()
         self.set_pipeline_budget({"mode": "count", "value": 1, "decision_ref": "PM-1"})

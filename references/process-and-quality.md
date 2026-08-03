@@ -180,7 +180,7 @@ The coordinator calls `devflow pipeline check` before starting the next task, as
 
 A task is consumed when at least one run record exists for its Issue since the budget started, whatever the status: `BLOCKED` and `HUMAN_NEEDED` consume a task too, because the attempt was made. Here the unit is a task, not a pass, and stopping early is safer than stopping late. While a budget is active, every run record therefore requires `--issue`: an unattributed record would spend the budget invisibly.
 
-The budget's identity is the triple `(decision_ref, mode, value)`. A new decision starts the count again, and there is no separate reset command by construction. Changing the mode or the value under the same reference is refused: raising `count` from 5 to 50 without a new decision would be a silent extension.
+The budget's identity is the triple `(decision_ref, mode, value)`. A new decision starts the count again, and there is no separate reset command by construction. Changing the mode or the value under the same reference is refused at the moment of the change, and the configuration is not written: raising `count` from 5 to 50 without a new decision would be a silent extension. Repeating the same command is idempotent and keeps the count. `pipeline check` repeats the comparison, which is what catches a configuration edited by hand outside the CLI.
 
 When the budget runs out, stop the chain and present the analysis:
 

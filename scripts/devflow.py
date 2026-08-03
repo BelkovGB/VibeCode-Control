@@ -2971,18 +2971,39 @@ def configure_value(repo: Path, dotted: str, raw: str) -> dict[str, Any]:
         parts = dotted.split(".")
         target = parts[1] if len(parts) > 1 else ""
         mark_skill_revalidation(config, workflow, lock, target)
-    result = apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "config-set")
-    if dotted == "automation.pipeline" or dotted.startswith("automation.pipeline."):
-        # The command that sets the budget is the honest place to stamp its start:
-        # a coordinator cannot forget a step that is the same action.
-        budget = pipeline_budget_of(config)
-        result["pipeline_state"] = (
-            write_pipeline_state(repo, budget) if budget["mode"] != "manual" else None
+    # The command that sets the budget is the honest place to stamp its start: a
+    # coordinator cannot forget a step that is the same action.  But the stamp must not
+    # simply follow the configuration, or the budget could be raised — or its count
+    # silently restarted by an identical repeat — under the same decision.
+    touches_pipeline = dotted == "automation.pipeline" or dotted.startswith("automation.pipeline.")
+    budget = pipeline_budget_of(config) if touches_pipeline else None
+    state_path = ensure_within(repo, PIPELINE_STATE_PATH)
+    previous_state = load_json(state_path) if touches_pipeline and state_path.is_file() else None
+    same_decision = (
+        isinstance(previous_state, dict)
+        and budget is not None
+        and budget["mode"] != "manual"
+        and previous_state.get("decision_ref") == budget["decision_ref"]
+    )
+    if same_decision and (
+        previous_state.get("mode") != budget["mode"] or previous_state.get("value") != budget["value"]
+    ):
+        raise DevflowError(
+            "Бюджет изменён без нового решения — укажите новый decision_ref. "
+            f"Записано было mode={previous_state.get('mode')} value={previous_state.get('value')}, "
+            f"запрошено mode={budget['mode']} value={budget['value']}"
         )
+    result = apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "config-set")
+    if touches_pipeline:
         if budget["mode"] == "manual":
-            state_path = ensure_within(repo, PIPELINE_STATE_PATH)
             if state_path.is_file():
                 state_path.unlink()
+            result["pipeline_state"] = None
+        elif same_decision:
+            # Identical repeat: the budget did not change, so neither does its count.
+            result["pipeline_state"] = previous_state
+        else:
+            result["pipeline_state"] = write_pipeline_state(repo, budget)
     return result
 
 
