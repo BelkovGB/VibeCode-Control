@@ -48,6 +48,18 @@ SETUP_STAGE_SEQUENCE = (
 )
 MANAGED_START = "<!-- devflow:managed:start -->"
 MANAGED_END = "<!-- devflow:managed:end -->"
+# Sections the tool builds from verified facts.  A separate marker pair from the managed
+# block: `doctor` compares these against the configuration and the inspection, while the
+# managed block is compared against the role split, and one must never be read as the
+# other when both live in the same file.
+GENERATED_START = "<!-- devflow:generated:{name}:start -->"
+GENERATED_END = "<!-- devflow:generated:{name}:end -->"
+AGENTS_DOCS_DIR = "docs/agents"
+AGENTS_ROUTER_PATH = "AGENTS.md"
+# Router slots the tool fills from facts.  Prose that used to occupy one of them moves
+# out to `docs/agents/` instead of being melted into generated text: otherwise the
+# completeness accounting stops being decidable.
+GENERATED_SECTIONS = ("build-and-checks", "repository-structure")
 GITIGNORE_START = "# devflow:managed:start"
 GITIGNORE_END = "# devflow:managed:end"
 STATUS_VALUES = {"PASS", "PARTIAL", "BLOCKED", "NOT_APPLICABLE"}
@@ -533,6 +545,8 @@ def plan_path_allowed(mode: str, relative: str) -> bool:
         return relative in {CONFIG_PATH, SKILLS_LOCK_PATH}
     if mode == "graph-migrate":
         return relative == WORKFLOW_PATH
+    if mode == "agents-normalize":
+        return relative in {"AGENTS.md", "CLAUDE.md"} or relative.startswith(f"{AGENTS_DOCS_DIR}/")
     if mode == "setup-mark":
         return relative == SETUP_STATE_PATH
     if mode in {"skills-decision", "skills-unassign"}:
@@ -4269,6 +4283,7 @@ def doctor(repo: Path, deep: bool = False, refresh_skills: bool = False, repair_
     findings.append(workspace_report(repo, config))
     findings.append(session_report(repo, config, workflow))
     findings.append(scale_report(repo, config))
+    findings.append(generated_section_report(repo, config))
 
     due = []
     today = utc_now().date()
@@ -5119,6 +5134,425 @@ def workspace_report(repo: Path, config: Any) -> dict[str, Any]:
         status = "PARTIAL"
     return {"check": "workspaces", "status": status, "roles": resolved,
             "findings": findings, "pending": pending}
+
+
+def split_markdown_sections(text: str) -> list[dict[str, Any]]:
+    """Cut a document at its level-2 headings, keeping every character somewhere."""
+    sections: list[dict[str, Any]] = []
+    current = {"title": None, "lines": []}
+    for line in text.splitlines():
+        heading = re.fullmatch(r"##\s+(.*)", line.rstrip())
+        if heading:
+            sections.append(current)
+            current = {"title": heading.group(1).strip(), "lines": []}
+            continue
+        current["lines"].append(line)
+    sections.append(current)
+    return [
+        {"title": item["title"], "body": "\n".join(item["lines"]).strip()}
+        for item in sections
+        if item["title"] is not None or "\n".join(item["lines"]).strip()
+    ]
+
+
+def strip_managed_block(text: str) -> str:
+    """Remove the VibeCode Control block: it is regenerated, not user content."""
+    if MANAGED_START in text and MANAGED_END in text:
+        before, tail = text.split(MANAGED_START, 1)
+        _, after = tail.split(MANAGED_END, 1)
+        return before + after
+    return text
+
+
+def generated_section_body(text: str, name: str) -> str | None:
+    start = GENERATED_START.format(name=name)
+    end = GENERATED_END.format(name=name)
+    if start not in text or end not in text:
+        return None
+    body = text.split(start, 1)[1].split(end, 1)[0]
+    return body.strip()
+
+
+def replace_generated_section(text: str, name: str, body: str) -> str:
+    start = GENERATED_START.format(name=name)
+    end = GENERATED_END.format(name=name)
+    if start in text and end in text:
+        before, tail = text.split(start, 1)
+        _, after = tail.split(end, 1)
+        return before + start + "\n" + body.strip() + "\n" + end + after
+    return text
+
+
+def drop_generated_prefix(body: str, prefix: str) -> str:
+    """Remove a prefix this tool wrote itself, leaving anything the owner added.
+
+    A second run must not mistake the router's own opening for user prose and move it
+    into `docs/`; comparison is line by line and bails out untouched on the first
+    mismatch, so a preamble somebody edited stays theirs.
+    """
+    body_lines = body.splitlines()
+    index = 0
+    for expected in prefix.splitlines():
+        if not expected.strip():
+            continue
+        while index < len(body_lines) and not body_lines[index].strip():
+            index += 1
+        if index >= len(body_lines) or body_lines[index].strip() != expected.strip():
+            return body
+        index += 1
+    return "\n".join(body_lines[index:]).strip()
+
+
+def strip_generated_regions(text: str) -> str:
+    """Drop every marked generated region, leaving whatever the owner wrote around it."""
+    for name in GENERATED_SECTIONS:
+        start = GENERATED_START.format(name=name)
+        end = GENERATED_END.format(name=name)
+        while start in text and end in text:
+            before, tail = text.split(start, 1)
+            _, after = tail.split(end, 1)
+            text = before + after
+    return text.strip()
+
+
+def normalized_content(text: str) -> str:
+    """Compare content, not layout: whitespace differences are not lost words."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def agents_slug(title: str, taken: set[str]) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "section"
+    slug = base
+    index = 2
+    # Two sections may legitimately carry the same heading; both survive, and the
+    # suffix is deterministic so a second run produces the same file names.
+    while slug in taken:
+        slug = f"{base}-{index}"
+        index += 1
+    taken.add(slug)
+    return slug
+
+
+def build_generated_sections(repo: Path, config: Any, inspection: dict[str, Any],
+                             pending_dirs: set[str] | None = None) -> dict[str, str]:
+    """Facts only.  An unmeasured baseline yields the honest absence, not a guess."""
+    quality = config.get("quality") if isinstance(config, dict) else {}
+    quality = quality if isinstance(quality, dict) else {}
+    commands = quality.get("commands") if isinstance(quality.get("commands"), dict) else {}
+    measured = quality.get("baseline_status") == "measured"
+    lines: list[str] = []
+    if measured:
+        for name in sorted(commands):
+            entries = commands[name]
+            entries = [str(item) for item in entries] if isinstance(entries, list) else []
+            for entry in entries:
+                lines.append(f"- `{name}`: `{entry}`")
+    if lines:
+        build = "\n".join(lines)
+    else:
+        build = (
+            "No verified command is configured. Measure the baseline and record the "
+            "commands first: `devflow audit quality`, then "
+            "`devflow config set quality.commands.unit '[\"<command>\"]'`."
+        )
+    # Directories this very plan creates count as present: otherwise the section would
+    # describe the repository as it was one moment before the write, and the next run
+    # would have to correct it.
+    entries = sorted(
+        {path.name for path in repo.iterdir()
+         if path.is_dir() and path.name not in IGNORED_DIRS and not path.name.startswith(".")}
+        | (pending_dirs or set())
+    )
+    stacks = inspection.get("project", {}).get("stacks") or []
+    structure_lines = [f"- `{name}/`" for name in entries] or ["- (no top-level directories)"]
+    if stacks:
+        structure_lines.append(f"- detected stacks: {', '.join(str(item) for item in stacks)}")
+    return {"build-and-checks": build, "repository-structure": "\n".join(structure_lines)}
+
+
+def plan_agents_normalization(repo: Path, config: Any) -> dict[str, Any]:
+    """Restructure AGENTS.md into a router, accounting for every character it held.
+
+    The split is structural and deterministic: headings decide, nothing is summarised.
+    A section that would land in a generated slot moves out to `docs/agents/` instead —
+    generation never melts foreign prose into itself, because then completeness could
+    no longer be decided.  What the tool cannot place, it moves and links; what it
+    cannot account for, it refuses to write.
+    """
+    router_source = find_project_kit(repo) / "managed" / "agents-router.md"
+    if not router_source.is_file():
+        raise DevflowError(
+            "Шаблон роутера недоступен: выполните `devflow upgrade --apply`"
+        )
+    template = router_source.read_text(encoding="utf-8")
+    path = repo / AGENTS_ROUTER_PATH
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    user_content = strip_managed_block(existing)
+    template_sections = split_markdown_sections(template)
+    template_preamble = next(
+        (item["body"] for item in template_sections if item["title"] is None), ""
+    )
+    sections = split_markdown_sections(user_content)
+    for section in sections:
+        if section["title"] is None and template_preamble:
+            section["body"] = drop_generated_prefix(section["body"], template_preamble)
+    slot_titles = {item["title"] for item in template_sections if item["title"]}
+    generated_titles = {"Build and checks", "Repository structure"}
+    router = template
+    taken: set[str] = set()
+    moved: list[dict[str, str]] = []
+    kept: list[tuple[str, str]] = []
+    links: list[str] = []
+    for section in sections:
+        title = section["title"]
+        body = section["body"]
+        if not body and title is None:
+            continue
+        if title is None:
+            title = "Preamble"
+        if title in generated_titles:
+            # Already a router: the marked region is regenerated from facts, and only
+            # prose the owner wrote around it is theirs to move.
+            body = strip_generated_regions(body)
+            if not normalized_content(body):
+                continue
+        elif title == "Deep context":
+            # Links to documents an earlier run moved out: router content, kept as is.
+            links.extend(line for line in body.splitlines() if line.strip().startswith("- ["))
+            continue
+        elif title in slot_titles:
+            # A slot the tool does not generate keeps the owner's words in place.
+            kept.append((title, body))
+            continue
+        slug = agents_slug(title, taken)
+        relative = f"{AGENTS_DOCS_DIR}/{slug}.md"
+        moved.append({"title": title, "where": relative, "body": body})
+        links.append(f"- [{title}]({relative})")
+    pending_dirs = {Path(item["where"]).parts[0] for item in moved}
+    generated = build_generated_sections(
+        repo, config, inspect_repository(repo), pending_dirs)
+    for name, body in generated.items():
+        router = replace_generated_section(router, name, body)
+    for title, body in kept:
+        router = replace_router_slot(router, title, body)
+    if links:
+        router = replace_router_slot(
+            router, "Deep context", "\n".join(dict.fromkeys(links)))
+    return {
+        "router": router,
+        "moved": moved,
+        "kept": [{"title": title, "where": AGENTS_ROUTER_PATH} for title, _ in kept],
+        "generated": sorted(generated),
+        "had_managed_block": MANAGED_START in existing,
+        # Regenerated regions are excluded from the completeness accounting for the same
+        # reason the managed block is: the mechanism owns them, they were never the
+        # owner's words, and comparing them would compare facts against older facts.
+        "original": strip_generated_regions(user_content),
+    }
+
+
+def replace_router_slot(router: str, title: str, body: str) -> str:
+    """Put a body under a router heading, keeping any generated markers intact."""
+    sections = split_markdown_sections(router)
+    rendered: list[str] = []
+    for section in sections:
+        if section["title"] is None:
+            if section["body"]:
+                rendered.append(section["body"])
+            continue
+        content = section["body"]
+        if section["title"] == title:
+            comment = "\n".join(
+                line for line in content.splitlines()
+                if line.strip().startswith("<!--") and "devflow:generated" not in line
+            )
+            del comment
+            preserved = "\n".join(
+                line for line in content.splitlines()
+                if "devflow:generated" in line
+            )
+            content = (preserved + "\n\n" + body).strip() if preserved else body.strip()
+        rendered.append(f"## {section['title']}\n\n{content}".rstrip())
+    return "\n\n".join(part for part in rendered if part).strip() + "\n"
+
+
+def generated_section_report(repo: Path, config: Any) -> dict[str, Any]:
+    """Compare the generated router sections with the facts they are built from.
+
+    Only the marked regions are compared, and only against the configuration and the
+    inspection — a hand edit inside them is drift, while everything the owner wrote
+    around them is theirs and is never judged here.
+    """
+    path = repo / AGENTS_ROUTER_PATH
+    if not path.is_file():
+        return {"check": "generated-sections", "status": "NOT_APPLICABLE", "details": []}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    present = [name for name in GENERATED_SECTIONS if generated_section_body(text, name) is not None]
+    if not present:
+        return {
+            "check": "generated-sections", "status": "NOT_APPLICABLE", "details": [],
+            "note": "AGENTS.md не содержит генерируемых секций: `devflow agents normalize`",
+        }
+    expected = build_generated_sections(repo, config, inspect_repository(repo))
+    details: list[dict[str, Any]] = []
+    status = "PASS"
+    for name in present:
+        actual = generated_section_body(text, name) or ""
+        if normalized_content(actual) != normalized_content(expected.get(name, "")):
+            details.append({"section": name, "state": "drift"})
+            status = "PARTIAL"
+        else:
+            details.append({"section": name, "state": "current"})
+    return {
+        "check": "generated-sections",
+        "status": status,
+        "details": details,
+        "note": (
+            "Секция расходится с фактами конфигурации: правьте источник и выполните "
+            "`devflow agents normalize --apply`, а не текст секции"
+            if status != "PASS" else "Генерируемые секции соответствуют фактам"
+        ),
+    }
+
+
+def nested_agents_files(repo: Path) -> list[str]:
+    """Nested instruction files, listed and never touched: both clients read them, and
+    they belong to whoever owns that directory."""
+    found: list[str] = []
+    for path in sorted(repo.rglob("AGENTS.md")):
+        relative = path.relative_to(repo).as_posix()
+        if relative == AGENTS_ROUTER_PATH:
+            continue
+        if any(part in IGNORED_DIRS for part in path.relative_to(repo).parts):
+            continue
+        found.append(relative)
+    return found
+
+
+def agents_normalize(repo: Path, apply: bool = False, full_diff: bool = False) -> dict[str, Any]:
+    """Turn AGENTS.md into a router without losing a word of what it held."""
+    config = load_json(repo / CONFIG_PATH) if (repo / CONFIG_PATH).is_file() else {}
+    workflow = load_json(repo / WORKFLOW_PATH) if (repo / WORKFLOW_PATH).is_file() else {}
+    kit = find_project_kit(repo)
+    plan_data = plan_agents_normalization(repo, config)
+    router = plan_data["router"]
+    block = (kit / "managed" / "AGENTS.block.md").read_text(encoding="utf-8")
+    router = replace_managed_block(router, block)
+
+    outputs: dict[str, str] = {AGENTS_ROUTER_PATH: router}
+    for item in plan_data["moved"]:
+        outputs[item["where"]] = f"# {item['title']}\n\n{item['body']}\n"
+
+    # Completeness is checked, not asserted: every character the file held is either in
+    # the router or in a moved document.  The managed block is excluded because the
+    # mechanism regenerates it — it was never the owner's text.
+    unaccounted: list[str] = []
+    haystacks = [normalized_content(text) for text in outputs.values()]
+    for section in split_markdown_sections(plan_data["original"]):
+        body = normalized_content(section["body"])
+        if not body:
+            continue
+        if not any(body in item for item in haystacks):
+            unaccounted.append(section["title"] or "Preamble")
+    if unaccounted:
+        return {
+            "status": "BLOCKED",
+            "applied": False,
+            "unaccounted": unaccounted,
+            "note": (
+                "Нормализация остановлена: содержимое этих секций не удалось разместить "
+                "без потерь — " + ", ".join(unaccounted)
+            ),
+        }
+
+    claude_path = repo / "CLAUDE.md"
+    claude_existing = claude_path.read_text(encoding="utf-8") if claude_path.is_file() else ""
+    claude_user = strip_managed_block(claude_existing).strip()
+    pointer = (
+        "# CLAUDE.md\n\n"
+        f"The project canon lives in [AGENTS.md]({AGENTS_ROUTER_PATH}). Read it first; "
+        "this file carries only what is specific to Claude.\n"
+    )
+    claude_user = drop_generated_prefix(claude_user, pointer)
+    # Links an earlier run wrote are router content, not user prose: they are lifted out
+    # before the split and put back afterwards, so a second run neither moves them again
+    # nor drops the documents they point at.
+    claude_links = [
+        line.strip() for line in claude_user.splitlines() if line.strip().startswith("- [")
+    ]
+    claude_user = "\n".join(
+        line for line in claude_user.splitlines()
+        if not line.strip().startswith("- [") and line.strip() != "Claude-specific context:"
+    ).strip()
+    claude_sections = [
+        section for section in split_markdown_sections(claude_user)
+        if normalized_content(section["body"])
+    ]
+    claude_moved: list[dict[str, str]] = []
+    taken = {Path(item["where"]).stem for item in plan_data["moved"]}
+    for section in claude_sections:
+        title = section["title"] or "Claude notes"
+        slug = agents_slug(f"claude-{title}", taken)
+        relative = f"{AGENTS_DOCS_DIR}/{slug}.md"
+        outputs[relative] = f"# {title}\n\n{section['body']}\n"
+        claude_moved.append({"title": title, "where": relative})
+    claude_links.extend(f"- [{item['title']}]({item['where']})" for item in claude_moved)
+    if claude_links:
+        pointer += "\nClaude-specific context:\n\n" + "\n".join(
+            dict.fromkeys(claude_links)
+        ) + "\n"
+    outputs["CLAUDE.md"] = replace_managed_block(
+        pointer, render_client_role_block(config, workflow, "claude", "Claude roles in this project")
+    )
+
+    operations = []
+    for relative, text in sorted(outputs.items()):
+        operation = make_operation(repo, relative, text.encode("utf-8"))
+        if operation:
+            operations.append(operation)
+    mapping = (
+        [{"section": item["title"], "from": AGENTS_ROUTER_PATH, "to": item["where"]}
+         for item in plan_data["moved"]]
+        + [{"section": item["title"], "from": AGENTS_ROUTER_PATH, "to": item["where"]}
+           for item in plan_data["kept"]]
+        + [{"section": item["title"], "from": "CLAUDE.md", "to": item["where"]}
+           for item in claude_moved]
+    )
+    if plan_data["had_managed_block"]:
+        mapping.append({"section": "managed", "from": AGENTS_ROUTER_PATH, "to": "регенерирован"})
+    report: dict[str, Any] = {
+        "map": mapping,
+        "generated_sections": plan_data["generated"],
+        "nested_agents_files": nested_agents_files(repo),
+        "nested_note": "Вложенные AGENTS.md не тронуты: их читают оба клиента, и они принадлежат своим каталогам.",
+    }
+    if not operations:
+        report.update({"status": "NOT_APPLICABLE", "applied": False,
+                       "note": "AGENTS.md уже нормализован"})
+        return report
+    plan = attach_effective_configuration(repo, {
+        "schema_version": 1,
+        "devflow_version": VERSION,
+        "run_id": run_id("agents-normalize"),
+        "mode": "agents-normalize",
+        "created_at": iso_now(),
+        "repo": str(repo.resolve()),
+        "fingerprint": repo_fingerprint(repo),
+        "operations": operations,
+        "warnings": [],
+    })
+    if not apply:
+        report.update({
+            "status": "PARTIAL",
+            "applied": False,
+            "plan": summarize_plan(repo, plan, full_diff=full_diff),
+            "next_command": "devflow agents normalize --apply",
+        })
+        return report
+    result = apply_plan(repo, plan)
+    report.update({"status": result["status"], "applied": True,
+                   "run_id": result["run_id"], "manifest_sha256": result["manifest_sha256"]})
+    return report
 
 
 def parse_test_spec(text: str) -> dict[str, Any]:
@@ -6552,6 +6986,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference to the PM decision that authorizes continuing past a spent cycle budget",
     )
 
+    agents = sub.add_parser("agents", help="Instruction files: restructure AGENTS.md into a router")
+    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
+    agents_normalize_parser = agents_sub.add_parser(
+        "normalize", help="Plan or apply the restructuring; nothing is written without --apply"
+    )
+    agents_normalize_parser.add_argument("--apply", action="store_true")
+    agents_normalize_parser.add_argument("--full-diff", action="store_true")
+
     spec = sub.add_parser("spec", help="Test specification: structure and case-criterion coverage")
     spec_sub = spec.add_subparsers(dest="spec_command", required=True)
     spec_check = spec_sub.add_parser("check", help="Validate a test specification; reads only")
@@ -6881,6 +7323,11 @@ def execute(args: argparse.Namespace) -> int:
         result = operate_preflight(repo, args.node, args.issue, args.human_decision, args.change_type)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
+    if args.command == "agents":
+        if args.agents_command == "normalize":
+            result = agents_normalize(repo, args.apply, args.full_diff)
+            print_json(result)
+            return 0 if result["status"] in {"PASS", "NOT_APPLICABLE", "PARTIAL"} else 1
     if args.command == "spec":
         if args.spec_command == "check":
             report = check_test_spec_file(repo, args.path)
