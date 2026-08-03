@@ -172,7 +172,17 @@ Each edge must contain:
 
 Use only named predicates. Do not execute arbitrary expressions or shell from graph conditions.
 
-Every strongly connected component must be declared once in `allowed_cycles` with its exact node set, a positive `max_traversals`, and an `on_exhausted` destination outside the cycle. The executor must count traversals and stop at that destination; a positive number written on an edge is not by itself proof of enforcement.
+Every strongly connected component must be declared once in `allowed_cycles` with its exact node set, a positive `max_traversals`, and an `on_exhausted` destination outside the cycle.
+
+The CLI counts the traversals, so the number is enforced rather than merely written down. For one cycle and one Issue, `traversals = max over the cycle's nodes of (records of that node − 1)`: a traversal is a re-entry, and the first record of each node is free because nodes on the main path are recorded once before any correction. Only `PASS`, `PARTIAL` and `FAIL` count; `BLOCKED` and `HUMAN_NEEDED` are stops and never consume the budget.
+
+Records are grouped by a normalized Issue key: the reference is trimmed, a GitHub issue URL contributes its number, otherwise the last integer in the string is used, otherwise the lowercased string. The key is stored in the run record as `issue_key` beside the raw `issue`, so the grouping can be audited. Two unrelated references that normalize to the same key only tighten the budget, which is the safe direction. Every record of a node inside a declared cycle therefore requires `--issue`, for every status.
+
+`devflow operate --node <node> --issue <ref>` reports the budget and turns `BLOCKED` when it is spent, so another traversal never starts. `devflow run record` keeps a per-node backstop: a node already recorded `max_traversals + 1` times is refused without `--human-decision <ref>`. The cap is deliberately per node rather than global, because the review tail of the last legal traversal is written after the traversal count has already reached its maximum.
+
+The count comes from the local run-record history of this checkout, and `.agent-flow/.local/` is not committed. Counting across machines belongs to the coordinator, which must pass the same `--issue`.
+
+`policy.max_fix_cycles` caps every declared `max_traversals`. Its ceiling is 3; a value from 4 to 10 additionally requires `policy.max_fix_cycles_decision_ref`, a non-empty reference to the PM decision that raised it. `max_retries` on an edge outside `allowed_cycles` is a separate executor-side mechanism and is not part of this budget.
 
 ## Validation
 

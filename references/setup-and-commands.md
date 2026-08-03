@@ -154,8 +154,8 @@ devflow audit git|code|quality|ci|docs|security|skills|all [--deep]
 devflow doctor [--deep] [--refresh-skills] [--repair-plan]
 devflow scheme check
 devflow scheme repair [--apply]
-devflow operate --node <id>
-devflow run record --node <id> --status <status> --head-sha <sha> --issue <ref> --pr <ref> --evidence "<expected_evidence>=<artifact-ref>" --check <name>=<conclusion> --actual-agent <id> --actual-model <id> --actual-effort <level>
+devflow operate --node <id> [--issue <ref>]
+devflow run record --node <id> --status <status> --head-sha <sha> --issue <ref> --pr <ref> --evidence "<expected_evidence>=<artifact-ref>" --check <name>=<conclusion> --human-decision <ref> --actual-agent <id> --actual-model <id> --actual-effort <level>
 devflow run show [run-id]
 ```
 
@@ -176,6 +176,8 @@ A node may additionally declare an `evidence_contract` that binds an `expected_e
 Report observed checks with `--check <name>=<conclusion>`. Allowed conclusions are `success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, `action_required`, and `stale`. Only `success` proves a check: a reported `skipped` or `neutral` blocks the `PASS`, and every name in `config.github.required_checks` must be reported with `success`. The gate applies on the `verification`, `review` and `release` stages. On an `implementation` stage conclusions are recorded as evidence and not judged: a `tdd_red` node must prove a test that legitimately fails, so `--check tests=failure` there is recorded and does not block the `PASS`. After the merge, do not dispatch a workflow against the closed PR when it needs `refs/pull/<N>/merge`: the ref no longer exists, so the dispatch fabricates a result instead of proving one. `devflow run record` rejects such evidence on the post-merge node only — id `post_merge` or state `POST_MERGE_VERIFY`. Before the merge that ref is the canonical merge-gate reference and stays usable.
 
 The run record stores the reported `checks` and, per parameter, `configured.modes` and `configured.sources`. Comparison of configured against actual is mode-aware: `explicit` must match exactly; `inherited` requires the actually observed value; `unset` requires the observed value while the configuration stays unset; `not-applicable` rejects any actual value as fabricated.
+
+A node inside a declared cycle also carries a budget. Pass `--issue <ref>` to `operate` to see how many traversals this Issue has spent and how many remain; without it the budget cannot be evaluated and the preflight says so. A spent budget makes the preflight `BLOCKED` and asks for the six-point Stall control analysis, and `run record` refuses a further attempt on that node without `--human-decision <ref>`. The count comes from the local run-record history of this checkout.
 
 `devflow operate --node <id>` returns the node preflight together with `effective_configuration`, `required_artifacts` (the node’s evidence contract), and `self_modification` — the base ref used, the merge base, and which guarded paths this branch changes (`.agent-flow/`, `AGENTS.md`, `CLAUDE.md`, `.github/workflows/`, `.github/devflow/prompts/`, both `devflow-node` skill copies). If the base cannot be determined locally, it says so instead of guessing.
 

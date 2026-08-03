@@ -85,6 +85,12 @@ CHECK_CONCLUSIONS = {
     "timed_out", "action_required", "stale",
 }
 PROVEN_CHECK_CONCLUSIONS = {"success"}
+# Statuses that consume a cycle budget.  BLOCKED and HUMAN_NEEDED are stops, not
+# attempts: a stop-check must never eat the budget it reports on.
+COUNTED_RUN_STATUSES = {"PASS", "PARTIAL", "FAIL"}
+# The ceiling on declared cycle traversals.  Anything above it needs a named PM decision.
+MAX_FIX_CYCLES_CEILING = 3
+MAX_FIX_CYCLES_ABSOLUTE = 10
 # Stages where every reported check must be green.  Implementation nodes record their
 # conclusions as evidence instead: a RED node proves a test that legitimately fails.
 CHECK_GATED_STAGES = {"verification", "review", "release"}
@@ -1457,8 +1463,17 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
         errors.append("config.policy должен быть объектом")
         policy = {}
     max_fix_cycles = policy.get("max_fix_cycles", 2)
-    if not isinstance(max_fix_cycles, int) or max_fix_cycles < 1 or max_fix_cycles > 10:
-        errors.append("policy.max_fix_cycles должен быть целым числом от 1 до 10")
+    decision_ref = policy.get("max_fix_cycles_decision_ref")
+    named_decision = isinstance(decision_ref, str) and bool(decision_ref.strip())
+    if not isinstance(max_fix_cycles, int) or max_fix_cycles < 1 or max_fix_cycles > MAX_FIX_CYCLES_ABSOLUTE:
+        errors.append(f"policy.max_fix_cycles должен быть целым числом от 1 до {MAX_FIX_CYCLES_ABSOLUTE}")
+    elif max_fix_cycles > MAX_FIX_CYCLES_CEILING and not named_decision:
+        # A higher ceiling is a product decision, not a quietly raised number.
+        errors.append(
+            f"policy.max_fix_cycles={max_fix_cycles} превышает потолок {MAX_FIX_CYCLES_CEILING}; "
+            "укажите policy.max_fix_cycles_decision_ref — непустую ссылку на решение PM "
+            f"(Issue, PR или документ), чтобы разрешить до {MAX_FIX_CYCLES_ABSOLUTE}"
+        )
     roles = config.get("roles")
     if not isinstance(roles, dict) or not roles:
         errors.append("config.roles отсутствует или пуст")
@@ -3647,7 +3662,7 @@ def guarded_control_plane_changes(repo: Path) -> dict[str, Any]:
     }
 
 
-def operate_preflight(repo: Path, node_id: str) -> dict[str, Any]:
+def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision: str = "") -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     config_errors, config_warnings = validate_config(config)
     workflow_errors, workflow_warnings = validate_workflow(workflow, config)
@@ -3688,6 +3703,29 @@ def operate_preflight(repo: Path, node_id: str) -> dict[str, Any]:
                 f"Параметр {pointer} не выбран (mode={MODE_UNDECIDED}); "
                 "объявите значение, наследование или явное отсутствие"
             )
+    # Preventive layer: an exhausted cycle must not start another traversal at all —
+    # unless a PM decision has already been made, in which case the recovery path
+    # (stop-check, decision, finish the traversal) has to stay open.
+    budget = None
+    override_ref = human_decision.strip() if isinstance(human_decision, str) else ""
+    if declared_cycle_for_node(workflow, node_id) is not None:
+        if normalize_issue_key(issue):
+            budget = cycle_budget(repo, workflow, node_id, issue)
+            if override_ref:
+                # The reference neither resets the budget nor raises max_traversals: it
+                # authorizes this step only, and every later one must name it again.
+                budget["override_ref"] = override_ref
+            if budget["exhausted"] and not override_ref:
+                external_blockers.append(
+                    f"Бюджет цикла {budget['cycle']} исчерпан для Issue {issue}: "
+                    f"пройдено {budget['traversals']} из {budget['max_traversals']}. "
+                    "Требуется стоп-чек PM из шести пунктов Stall control; продолжение записей — только "
+                    "с --human-decision <ref>. Бюджет считается по локальной истории этого checkout."
+                )
+        else:
+            external_gaps.append(
+                f"Узел {node_id} входит в цикл, но бюджет не вычислен: передайте --issue <ref>"
+            )
     if effective.get("agent") not in {"human", "script", "deterministic"}:
         automation = config.get("automation", {}) if isinstance(config.get("automation", {}), dict) else {}
         if automation.get("background_workers") != "verified":
@@ -3711,6 +3749,7 @@ def operate_preflight(repo: Path, node_id: str) -> dict[str, Any]:
         "status": status,
         "node": effective,
         "effective_configuration": effective_configuration(workflow, config, lock),
+        "cycle_budget": budget,
         "self_modification": guarded_control_plane_changes(repo),
         "required_artifacts": evidence_contract_for(nodes[node_id]),
         "config": {"errors": config_errors, "warnings": config_warnings},
@@ -3816,6 +3855,90 @@ def scheme_check(repo: Path, refresh_skills: bool = True) -> dict[str, Any]:
     }
 
 
+def normalize_issue_key(issue: Any) -> str:
+    """Group run records by the Issue they belong to, however the reference was spelled.
+
+    `#21`, `21` and a GitHub issue URL are the same Issue.  The normalized key is stored
+    beside the raw reference so the grouping stays auditable.  A collision such as
+    `ISSUE-1` with `PR-1` only tightens the budget, which is the safe direction.
+    """
+    if not isinstance(issue, str):
+        return ""
+    text = issue.strip()
+    if not text:
+        return ""
+    url = re.search(r"github\.com/[^/\s]+/[^/\s]+/issues/(\d+)", text, re.I)
+    if url:
+        return url.group(1)
+    numbers = re.findall(r"\d+", text)
+    if numbers:
+        return numbers[-1]
+    return text.lower()
+
+
+def declared_cycle_for_node(workflow: Any, node_id: str) -> dict[str, Any] | None:
+    for cycle in workflow.get("allowed_cycles", []) if isinstance(workflow, dict) else []:
+        if isinstance(cycle, dict) and node_id in (cycle.get("nodes") or []):
+            return cycle
+    return None
+
+
+def iter_run_records(repo: Path) -> list[dict[str, Any]]:
+    """Read every stored run record.  Counting must not use the capped recent view."""
+    directory = repo / f"{LOCAL_DIR}/node-runs"
+    if not directory.is_dir():
+        return []
+    records: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            value = load_json(path)
+        except DevflowError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
+def cycle_budget(repo: Path, workflow: Any, node_id: str, issue: str) -> dict[str, Any] | None:
+    """Report how much of a declared cycle's budget this Issue has already spent.
+
+    A traversal is a re-entry, not a visit: nodes on the main path are recorded once
+    before any correction happens, so the first record of each node is free.
+    """
+    cycle = declared_cycle_for_node(workflow, node_id)
+    if cycle is None:
+        return None
+    issue_key = normalize_issue_key(issue)
+    nodes = [str(item) for item in (cycle.get("nodes") or [])]
+    counts = {name: 0 for name in nodes}
+    for record in iter_run_records(repo):
+        if record.get("status") not in COUNTED_RUN_STATUSES:
+            continue
+        name = record.get("node")
+        if name not in counts:
+            continue
+        recorded_key = record.get("issue_key") or normalize_issue_key(record.get("issue"))
+        if issue_key and recorded_key != issue_key:
+            continue
+        counts[name] += 1
+    max_traversals = cycle.get("max_traversals")
+    max_traversals = max_traversals if isinstance(max_traversals, int) and max_traversals > 0 else 1
+    traversals = max((max(0, value - 1) for value in counts.values()), default=0)
+    return {
+        "cycle": cycle.get("id"),
+        "nodes": nodes,
+        "issue": issue,
+        "issue_key": issue_key,
+        "counts": counts,
+        "max_traversals": max_traversals,
+        "traversals": traversals,
+        "remaining": max(0, max_traversals - traversals),
+        "exhausted": traversals >= max_traversals,
+        "on_exhausted": cycle.get("on_exhausted"),
+        "scope": "локальная история этого checkout",
+    }
+
+
 def parse_check_results(items: list[str] | None) -> dict[str, str]:
     """Parse `--check name=conclusion` pairs.  A job status alone proves nothing."""
     results: dict[str, str] = {}
@@ -3843,7 +3966,8 @@ def evidence_contract_for(node: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr: str,
                evidence: list[str], actual_agent: str | None, actual_model: str | None,
-               actual_effort: str | None, checks: list[str] | None = None) -> dict[str, Any]:
+               actual_effort: str | None, checks: list[str] | None = None,
+               human_decision: str | None = None) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     nodes = {item["id"]: item for item in workflow["nodes"]}
     if node not in nodes:
@@ -3855,6 +3979,27 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
     if not evidence or not all(isinstance(item, str) and item.strip() for item in evidence):
         raise DevflowError("Run record требует хотя бы одно непустое доказательство")
     check_results = parse_check_results(checks)
+    # A record of a node inside a declared cycle has to be attributable to an Issue, or
+    # the budget can be spent through unattributed records.
+    budget = declared_cycle_for_node(workflow, node)
+    issue_key = normalize_issue_key(issue)
+    if budget is not None and not issue_key:
+        raise DevflowError(
+            f"Узел {node} входит в объявленный цикл {budget.get('id')}: запись требует --issue, "
+            "иначе бюджет цикла не к чему привязать"
+        )
+    decision = human_decision.strip() if isinstance(human_decision, str) else ""
+    spent = cycle_budget(repo, workflow, node, issue) if budget is not None else None
+    if spent is not None and status in COUNTED_RUN_STATUSES:
+        # Per-node cap, not a global one: the tail of the last legal traversal must still
+        # be recordable after the traversal count has already reached its maximum.
+        if spent["counts"].get(node, 0) >= spent["max_traversals"] + 1 and not decision:
+            raise DevflowError(
+                f"Бюджет цикла {spent['cycle']} исчерпан для Issue {issue}: узел {node} уже записан "
+                f"{spent['counts'][node]} раз при max_traversals={spent['max_traversals']}. "
+                "Требуется стоп-чек PM из шести пунктов Stall control; продолжение записей — только с "
+                "--human-decision <ref>. Бюджет считается по локальной истории этого checkout."
+            )
     stage = nodes[node].get("stage")
     evidence_by_name: dict[str, str] = {}
     if status == "PASS" and stage in {"implementation", "verification", "review", "release"}:
@@ -3935,7 +4080,7 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                         f"Доказательство {name} ссылается на refs/pull/<N>/merge; "
                         "post-merge проверка не запускается на закрытом PR"
                     )
-        preflight = operate_preflight(repo, node)
+        preflight = operate_preflight(repo, node, issue, decision)
         if preflight["status"] != "PASS":
             reasons = (
                 preflight.get("external_gaps", [])
@@ -3991,8 +4136,12 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
         "state": nodes[node]["state"],
         "status": status,
         "issue": issue,
+        "issue_key": issue_key,
         "pr": pr,
         "head_sha": head_sha,
+        "human_decision": decision or None,
+        # The budget as observed before this record was added.
+        "cycle_budget": spent,
         "configured": {
             "role": effective["role"],
             "agent": effective["agent"],
@@ -4308,6 +4457,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     operate = sub.add_parser("operate", help="Preflight one configured workflow node")
     operate.add_argument("--node", required=True)
+    operate.add_argument("--issue", default="", help="Issue reference; required to evaluate a cycle budget")
+    operate.add_argument(
+        "--human-decision",
+        default="",
+        metavar="REF",
+        help="Reference to the PM decision that authorizes continuing past a spent cycle budget",
+    )
 
     run = sub.add_parser("run", help="Record or inspect background run evidence")
     run_sub = run.add_subparsers(dest="run_command", required=True)
@@ -4321,6 +4477,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_record.add_argument("--actual-agent")
     run_record.add_argument("--actual-model")
     run_record.add_argument("--actual-effort")
+    run_record.add_argument(
+        "--human-decision",
+        default="",
+        metavar="REF",
+        help="Reference to the PM decision that extends an exhausted cycle budget",
+    )
     run_record.add_argument(
         "--check",
         action="append",
@@ -4589,7 +4751,7 @@ def execute(args: argparse.Namespace) -> int:
         print_json({"status": status, "applied": bool(args.apply), "clients": reports})
         return 0 if status == "PASS" else 1
     if args.command == "operate":
-        result = operate_preflight(repo, args.node)
+        result = operate_preflight(repo, args.node, args.issue, args.human_decision)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
     if args.command == "run":
@@ -4597,6 +4759,7 @@ def execute(args: argparse.Namespace) -> int:
             print_json(record_run(
                 repo, args.node, args.status, args.head_sha, args.issue, args.pr, args.evidence,
                 args.actual_agent, args.actual_model, args.actual_effort, args.check,
+                args.human_decision,
             ))
             return 0
         if args.run_command == "show":
