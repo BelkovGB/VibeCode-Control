@@ -1489,6 +1489,87 @@ class DevflowTestCase(unittest.TestCase):
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("от 1 до 10" in item for item in errors))
 
+    # --- workspace roles ------------------------------------------------------------------
+
+    def declare_workspaces(self, control=".", worktree="../work", scratch=None):
+        for role, value in [
+            ("control_checkout", {"mode": "explicit", "path": control,
+                                  "changes": True, "dependencies": False, "tests": False}),
+            ("issue_worktree", {"mode": "explicit", "path": worktree,
+                                "changes": True, "dependencies": True, "tests": True}),
+            ("scratch", scratch or {"mode": "not-applicable"}),
+        ]:
+            devflow.configure_value(
+                self.repo, f"automation.workspaces.{role}", json.dumps(value))
+
+    def test_kit_declares_no_workspace_and_setup_asks_for_each_role(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertNotIn("workspaces", config["automation"])
+        self.apply_init()
+        stage = next(item for item in devflow.evaluate_setup(self.repo)
+                     if item["stage"] == "workspaces")
+        self.assertEqual(stage["status"], "PARTIAL")
+        self.assertTrue(stage["requires_user_decision"])
+        for role in devflow.WORKSPACE_ROLES:
+            self.assertTrue(any(role in gap for gap in stage["gaps"]), role)
+            self.assertIn(f"{role}=undecided", stage["evidence"])
+
+    def test_explicit_workspace_requires_a_path_and_explicit_permissions(self):
+        entry, errors = devflow.parse_workspace_role({"mode": "explicit"}, "automation.workspaces.scratch")
+        self.assertTrue(any(".path обязателен" in item for item in errors))
+        for permission in devflow.WORKSPACE_PERMISSIONS:
+            self.assertTrue(any(f".{permission} обязателен" in item for item in errors), permission)
+        del entry
+        _, clean = devflow.parse_workspace_role(
+            {"mode": "explicit", "path": ".", "changes": True, "dependencies": False, "tests": True},
+            "automation.workspaces.control_checkout")
+        self.assertEqual(clean, [])
+        _, forbidden = devflow.parse_workspace_role(
+            {"mode": "not-applicable", "path": "."}, "automation.workspaces.scratch")
+        self.assertTrue(any("недопустим при mode=not-applicable" in item for item in forbidden))
+
+    def test_unknown_workspace_role_is_rejected(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["automation"]["workspaces"] = {"build_cache": {"mode": "not-applicable"}}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("неизвестная роль каталога" in item for item in errors))
+
+    def test_doctor_catches_the_control_checkout_used_as_a_worktree(self):
+        self.apply_init()
+        self.declare_workspaces(control=".", worktree=".")
+        report = devflow.workspace_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertEqual(report["status"], "PARTIAL")
+        self.assertTrue(any("один каталог" in item for item in report["findings"]))
+
+    def test_doctor_catches_dependencies_in_the_control_checkout(self):
+        self.apply_init()
+        devflow.configure_value(
+            self.repo, "automation.workspaces.control_checkout",
+            json.dumps({"mode": "explicit", "path": ".", "changes": True,
+                        "dependencies": True, "tests": False}))
+        report = devflow.workspace_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertTrue(any("установку зависимостей" in item for item in report["findings"]))
+
+    def test_doctor_catches_scratch_tracked_inside_the_repository(self):
+        self.apply_init()
+        (self.repo / "tmp").mkdir()
+        self.declare_workspaces(scratch={"mode": "explicit", "path": "tmp",
+                                         "changes": True, "dependencies": False, "tests": False})
+        report = devflow.workspace_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertTrue(any("не игнорируется git" in item for item in report["findings"]))
+
+    def test_decided_workspaces_pass_the_stage(self):
+        self.apply_init()
+        (self.repo.parent / "work").mkdir(exist_ok=True)
+        self.declare_workspaces(control=".", worktree="../work")
+        stage = next(item for item in devflow.evaluate_setup(self.repo)
+                     if item["stage"] == "workspaces")
+        self.assertEqual(stage["status"], "PASS")
+        self.assertEqual(stage["gaps"], [])
+        self.assertFalse(stage["requires_user_decision"])
+
     # --- gate origin and the minimal validation plan --------------------------------------
 
     def declare_validation_plan(self, skip=("test fails for intended reason",)):

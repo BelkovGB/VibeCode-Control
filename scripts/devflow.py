@@ -139,6 +139,11 @@ GATE_REQUIRED_UNPROVEN = "required-and-unproven"
 # Today every gate applies to the whole repository.  Monorepo zones will arrive as a
 # different value of this same field, so the attribution contract does not change.
 GATE_SCOPE_REPOSITORY = "repository"
+# Where work is allowed to happen.  A run that edits the control checkout when it meant
+# to build in a worktree is the confusion this makes explicit.
+WORKSPACE_ROLES = ("control_checkout", "issue_worktree", "scratch")
+WORKSPACE_MODES = {MODE_EXPLICIT, MODE_NOT_APPLICABLE, MODE_UNDECIDED}
+WORKSPACE_PERMISSIONS = ("changes", "dependencies", "tests")
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", "node_modules", "vendor",
     ".venv", "venv", "dist", "build", "coverage", ".next", ".turbo",
@@ -1710,6 +1715,20 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
                 errors.extend(effort_vocabulary_errors(
                     f"node_overrides.{node_id}", override_agent, parsed_override["effort"], registry
                 ))
+    declared_workspaces = config.get("automation", {}).get("workspaces") if isinstance(config.get("automation"), dict) else None
+    if declared_workspaces is not None and not isinstance(declared_workspaces, dict):
+        errors.append("automation.workspaces должен быть объектом")
+    elif isinstance(declared_workspaces, dict):
+        for role in sorted(set(declared_workspaces) - set(WORKSPACE_ROLES)):
+            errors.append(
+                f"automation.workspaces.{role}: неизвестная роль каталога; известны: "
+                + ", ".join(WORKSPACE_ROLES)
+            )
+        for role in WORKSPACE_ROLES:
+            if role in declared_workspaces:
+                _, role_errors = parse_workspace_role(
+                    declared_workspaces[role], f"automation.workspaces.{role}")
+                errors.extend(role_errors)
     plan = validation_plan_of(config)
     if not isinstance(config.get("quality", {}).get("validation_plan", {}), dict):
         errors.append("quality.validation_plan должен быть объектом")
@@ -2976,6 +2995,22 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         bool(pending),
     ))
 
+    workspaces = workspace_report(repo, config)
+    workspace_gaps = [
+        f"{item['pointer']}: {item['decision']}" for item in workspaces["pending"]
+    ] + workspaces["findings"]
+    results.append(stage_result(
+        "workspaces",
+        "PARTIAL" if workspace_gaps else "PASS",
+        [f"{role}={entry.get('mode')}" for role, entry in sorted(workspaces["roles"].items())],
+        workspace_gaps,
+        "Зафиксируйте, где живёт управляющий слой, где идёт работа по Issue и где хранится временное, "
+        "и что разрешено в каждом каталоге.",
+        next_for["workspaces"],
+        workspaces["pending"][0]["command"] if workspaces["pending"] else command_for["workspaces"],
+        bool(workspaces["pending"]),
+    ))
+
     graph_status = "BLOCKED" if graph_errors else ("PARTIAL" if graph_warnings else "PASS")
     results.append(stage_result(
         "graph", graph_status,
@@ -3861,6 +3896,7 @@ def doctor(repo: Path, deep: bool = False, refresh_skills: bool = False, repair_
     configured_version = config.get("devflow_version") if isinstance(config, dict) else None
     findings.append({"check": "project-cli", "status": "PASS" if (repo / META_DIR / "devflow.py").is_file() and toolkit.is_dir() else "BLOCKED", "version": configured_version, "running_version": VERSION})
     findings.append(managed_block_report(repo))
+    findings.append(workspace_report(repo, config))
 
     due = []
     today = utc_now().date()
@@ -4553,6 +4589,120 @@ def gate_attribution(config: Any, workflow: Any, node: dict[str, Any],
         if gate["origin"] not in GATE_ORIGINS:
             raise DevflowError(f"Неизвестное происхождение гейта {gate['name']}: {gate['origin']}")
     return gates
+
+
+def parse_workspace_role(raw: Any, pointer: str) -> tuple[dict[str, Any], list[str]]:
+    """Parse one directory role: where it is and what may happen there."""
+    errors: list[str] = []
+    if raw is None:
+        return {"mode": MODE_UNDECIDED}, errors
+    if not isinstance(raw, dict):
+        return {"mode": MODE_UNDECIDED}, [f"{pointer} должен быть объектом с полем mode"]
+    mode = raw.get("mode")
+    allowed_keys = {"mode", "path", *WORKSPACE_PERMISSIONS}
+    unknown = sorted(set(raw) - allowed_keys)
+    if unknown:
+        errors.append(f"{pointer} содержит неизвестные ключи: {', '.join(unknown)}")
+    if mode not in WORKSPACE_MODES:
+        return {"mode": MODE_UNDECIDED}, errors + [
+            f"{pointer}.mode должен быть одним из: " + ", ".join(sorted(WORKSPACE_MODES))
+        ]
+    if mode != MODE_EXPLICIT:
+        for key in ("path", *WORKSPACE_PERMISSIONS):
+            if raw.get(key) is not None:
+                errors.append(f"{pointer}.{key} недопустим при mode={mode}")
+        return {"mode": mode}, errors
+    entry: dict[str, Any] = {"mode": MODE_EXPLICIT}
+    location = raw.get("path")
+    if not isinstance(location, str) or not location.strip():
+        errors.append(f"{pointer}.path обязателен и непуст при mode={MODE_EXPLICIT}")
+    else:
+        entry["path"] = location.strip()
+    for key in WORKSPACE_PERMISSIONS:
+        value = raw.get(key)
+        if not isinstance(value, bool):
+            errors.append(
+                f"{pointer}.{key} обязателен и булев: решение «можно здесь или нет» не подразумевается"
+            )
+        else:
+            entry[key] = value
+    return entry, errors
+
+
+def workspace_roles_of(config: Any) -> dict[str, dict[str, Any]]:
+    automation = config.get("automation") if isinstance(config, dict) else {}
+    automation = automation if isinstance(automation, dict) else {}
+    declared = automation.get("workspaces")
+    declared = declared if isinstance(declared, dict) else {}
+    resolved: dict[str, dict[str, Any]] = {}
+    for role in WORKSPACE_ROLES:
+        entry, _ = parse_workspace_role(declared.get(role), f"automation.workspaces.{role}")
+        resolved[role] = entry
+    return resolved
+
+
+def pending_workspace_decisions(config: Any) -> list[dict[str, str]]:
+    pending: list[dict[str, str]] = []
+    for role, entry in workspace_roles_of(config).items():
+        if entry.get("mode") == MODE_UNDECIDED:
+            pending.append({
+                "pointer": f"automation.workspaces.{role}",
+                "decision": f"Определите каталог роли {role} или объявите её неприменимой",
+                "command": f"devflow config set automation.workspaces.{role} '{{\"mode\": \"not-applicable\"}}'",
+            })
+    return pending
+
+
+def workspace_report(repo: Path, config: Any) -> dict[str, Any]:
+    """What the declared directory roles look like on this machine."""
+    roles = workspace_roles_of(config)
+    findings: list[str] = []
+    resolved: dict[str, Any] = {}
+    for role, entry in roles.items():
+        record = dict(entry)
+        if entry.get("mode") == MODE_EXPLICIT:
+            location = (repo / entry["path"]).resolve()
+            record["resolved_path"] = str(location)
+            record["exists"] = location.exists()
+            if not location.exists():
+                findings.append(f"{role}: каталог {entry['path']} не существует")
+        resolved[role] = record
+    control = resolved.get("control_checkout", {})
+    worktree = resolved.get("issue_worktree", {})
+    if control.get("mode") == MODE_EXPLICIT and worktree.get("mode") == MODE_EXPLICIT:
+        if control.get("resolved_path") == worktree.get("resolved_path"):
+            findings.append(
+                "control_checkout и issue_worktree указывают на один каталог: "
+                "работа по Issue не отделена от управляющего слоя"
+            )
+    if control.get("mode") == MODE_EXPLICIT and control.get("dependencies"):
+        findings.append(
+            "control_checkout разрешает установку зависимостей: управляющий checkout "
+            "не предназначен для сборки"
+        )
+    scratch = resolved.get("scratch", {})
+    if scratch.get("mode") == MODE_EXPLICIT and scratch.get("exists"):
+        location = pathlib_relative_to_repo(repo, scratch["resolved_path"])
+        if location is not None:
+            code, ignored, _ = run_process(["git", "check-ignore", location], repo)
+            if code != 0:
+                findings.append(
+                    f"scratch внутри репозитория и не игнорируется git: {location}"
+                )
+            del ignored
+    status = "PASS" if not findings else "PARTIAL"
+    pending = pending_workspace_decisions(config)
+    if pending:
+        status = "PARTIAL"
+    return {"check": "workspaces", "status": status, "roles": resolved,
+            "findings": findings, "pending": pending}
+
+
+def pathlib_relative_to_repo(repo: Path, candidate: str) -> str | None:
+    try:
+        return Path(candidate).resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return None
 
 
 def parse_check_results(items: list[str] | None) -> dict[str, str]:

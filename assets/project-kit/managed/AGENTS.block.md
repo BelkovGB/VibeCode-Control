@@ -18,6 +18,7 @@ For delivery work:
 - Merge only the exact verified SHA with every required check green and blocking thread resolved.
 - If architecture, component responsibilities, dependencies, data flow, storage, integrations, or deployment change, update `docs/ARCHITECTURE.md` and related ADR/runbook documentation in the same PR.
 - Record `BLOCKED` with evidence for technical blockers. Use `HUMAN_NEEDED` only for a product decision, material compromise, unavailable access, irreversible risk, or real human approval.
+- Work only where the configured directory roles allow it: `automation.workspaces` says which checkout holds the control plane, where Issue work happens and where throwaway state lives, and whether changes, dependency installation and test runs are permitted in each. Do not install dependencies or build inside the control checkout unless it is declared for that.
 - Do not start the next task autonomously without a chain budget: `devflow pipeline check` reports the remainder and refuses when it is spent, the template ships `{"mode": "manual"}`, and a new budget means a new `decision_ref`.
 - After two correction cycles without material progress, stop and present a concise stop-check to the PM. The cycle budget is enforced: `devflow operate --node <node> --issue <ref>` reports the remainder and blocks a spent cycle, `devflow run record` refuses an over-budget attempt, and extending it requires `--human-decision <ref>`.
 
