@@ -170,6 +170,27 @@ The budget is counted from the local run-record history of this checkout. `.agen
 
 Edge retries — `max_retries` on an edge outside `allowed_cycles`, such as the one on `tdd_red` — are a separate executor-side mechanism and are not covered by this budget.
 
+### Chain budget
+
+A cycle budget bounds the passes inside one task. The chain from one merged task to the next is bounded separately, and an autonomous chain runs only against an explicit budget.
+
+`automation.pipeline` states it: `{"mode": "manual"}` runs nothing autonomously and is what the template ships, `{"mode": "count", "value": N, "decision_ref": "<ref>"}` allows N tasks in a row, and `{"mode": "until", "value": "<issue-ref>", "decision_ref": "<ref>"}` runs up to and including a control task. A budget is a PM decision, so `count` and `until` require a non-empty `decision_ref`.
+
+The coordinator calls `devflow pipeline check` before starting the next task, as required by the node-dispatch protocol. It reports the remainder, whether the next task is allowed, and — when it is not — the exact reason to paste into the report.
+
+A task is consumed when at least one run record exists for its Issue since the budget started, whatever the status: `BLOCKED` and `HUMAN_NEEDED` consume a task too, because the attempt was made. Here the unit is a task, not a pass, and stopping early is safer than stopping late. While a budget is active, every run record therefore requires `--issue`: an unattributed record would spend the budget invisibly.
+
+The budget's identity is the triple `(decision_ref, mode, value)`. A new decision starts the count again, and there is no separate reset command by construction. Changing the mode or the value under the same reference is refused at the moment of the change, and the configuration is not written: raising `count` from 5 to 50 without a new decision would be a silent extension. Repeating the same command is idempotent and keeps the count. `pipeline check` repeats the comparison, which is what catches a configuration edited by hand outside the CLI.
+
+When the budget runs out, stop the chain and present the analysis:
+
+1. Done — Issues, PRs and merged head SHAs.
+2. In progress — what is started and where it stands.
+3. Blocked — what is stuck and on what.
+4. Recommendation — the next step, and the budget being requested for it.
+
+The count comes from the local run-record history of this checkout, exactly as for the cycle budget.
+
 ## Limits
 
 Track observed rate, review, context, tool, or runner limit signals. Consolidate independent checks and avoid unnecessary repeated reads. Warn when the selected order may exhaust an observable resource.

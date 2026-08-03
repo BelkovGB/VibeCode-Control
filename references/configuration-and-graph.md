@@ -182,6 +182,8 @@ Records are grouped by a normalized Issue key: the reference is trimmed, a GitHu
 
 The count comes from the local run-record history of this checkout, and `.agent-flow/.local/` is not committed. Counting across machines belongs to the coordinator, which must pass the same `--issue`.
 
+`automation.pipeline` bounds the chain of tasks rather than the passes inside one. `{"mode": "manual"}` is the shipped default and runs nothing autonomously; `{"mode": "count", "value": N, "decision_ref": "<ref>"}` allows N tasks; `{"mode": "until", "value": "<issue-ref>", "decision_ref": "<ref>"}` runs up to and including a control task, whose reference is normalized by the same rule as a run record's Issue. A task counts as consumed once any run record exists for its Issue since the budget started, so while a budget is active every record requires `--issue`. The budget's identity is `(decision_ref, mode, value)`: a new decision restarts the count, and changing the mode or value under the same reference is refused as a silent extension. `devflow pipeline check` reports the remainder and the reason for a refusal.
+
 `policy.max_fix_cycles` caps every declared `max_traversals`. Its ceiling is 3; a value from 4 to 10 additionally requires `policy.max_fix_cycles_decision_ref`, a non-empty reference to the PM decision that raised it. `max_retries` on an edge outside `allowed_cycles` is a separate executor-side mechanism and is not part of this budget.
 
 ## Validation

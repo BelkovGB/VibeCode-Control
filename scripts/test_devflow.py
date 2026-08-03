@@ -1486,6 +1486,169 @@ class DevflowTestCase(unittest.TestCase):
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("от 1 до 10" in item for item in errors))
 
+    # --- autonomous chain budget ---------------------------------------------------------
+
+    def set_pipeline_budget(self, budget):
+        return devflow.configure_value(self.repo, "automation.pipeline", json.dumps(budget))
+
+    def consume_chain_task(self, issue):
+        devflow.record_run(
+            self.repo, "inspect_project", "FAIL", "", issue, "", ["chain task"],
+            None, None, None,
+        )
+
+    def test_kit_ships_a_manual_pipeline_and_runs_nothing_autonomously(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertEqual(config["automation"]["pipeline"], {"mode": "manual"})
+        self.apply_init()
+        report = devflow.pipeline_check(self.repo)
+        self.assertFalse(report["allowed"])
+        self.assertEqual(report["status"], "BLOCKED")
+        self.assertIn("явному го PM", report["reason"])
+
+    def test_pipeline_budget_requires_a_named_decision(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["automation"]["pipeline"] = {"mode": "count", "value": 3}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("decision_ref обязателен" in item for item in errors))
+        config["automation"]["pipeline"] = {"mode": "count", "value": 0, "decision_ref": "PM-1"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("не меньше 1" in item for item in errors))
+        config["automation"]["pipeline"] = {"mode": "until", "decision_ref": "PM-1"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("контрольную задачу" in item for item in errors))
+
+    def test_count_budget_consumes_a_unit_per_attributed_task(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 2)
+        self.consume_chain_task("#31")
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 1)
+        # A second record for the same Issue is the same task, not a second one.
+        self.consume_chain_task("https://github.com/owner/repo/issues/31")
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 1)
+        self.consume_chain_task("#32")
+        spent = devflow.pipeline_check(self.repo)
+        self.assertEqual(spent["remaining"], 0)
+        self.assertFalse(spent["allowed"])
+        self.assertIn("отчёт-разбор", spent["reason"])
+        self.assertIn("новым decision_ref", spent["reason"])
+
+    def test_stop_statuses_still_consume_a_chain_task(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        devflow.record_run(
+            self.repo, "inspect_project", "BLOCKED", "", "#31", "", ["stopped"], None, None, None,
+        )
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 1)
+
+    def test_until_budget_includes_the_control_task_and_stops_after_it(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "until", "value": "#40", "decision_ref": "PM-2"})
+        self.consume_chain_task("#38")
+        allowed = devflow.pipeline_check(self.repo)
+        self.assertTrue(allowed["allowed"])
+        self.assertEqual(allowed["control_issue_key"], "40")
+        self.consume_chain_task("#40")
+        stopped = devflow.pipeline_check(self.repo)
+        self.assertFalse(stopped["allowed"])
+        self.assertIn("контрольная задача #40", stopped["reason"])
+
+    def test_changing_the_budget_under_the_same_decision_is_refused(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        devflow.pipeline_check(self.repo)
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["automation"]["pipeline"] = {"mode": "count", "value": 50, "decision_ref": "PM-1"}
+        (self.repo / devflow.CONFIG_PATH).write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        refused = devflow.pipeline_check(self.repo)
+        self.assertFalse(refused["allowed"])
+        self.assertIn("без нового решения", refused["reason"])
+
+    def test_raising_the_budget_under_the_same_decision_is_refused_at_the_mutation(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        self.consume_chain_task("#31")
+        self.consume_chain_task("#32")
+        self.assertFalse(devflow.pipeline_check(self.repo)["allowed"])
+        before_state = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        before_config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        with self.assertRaises(devflow.DevflowError) as context:
+            self.set_pipeline_budget({"mode": "count", "value": 5, "decision_ref": "PM-1"})
+        self.assertIn("без нового решения", str(context.exception))
+        # Neither the state nor the configuration may move.
+        self.assertEqual(devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH), before_state)
+        self.assertEqual(devflow.load_json(self.repo / devflow.CONFIG_PATH), before_config)
+        self.assertFalse(devflow.pipeline_check(self.repo)["allowed"])
+
+    def test_repeating_the_same_budget_command_keeps_the_count(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 3, "decision_ref": "PM-1"})
+        self.consume_chain_task("#31")
+        before = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        self.assertEqual(devflow.pipeline_check(self.repo)["consumed_count"], 1)
+        self.set_pipeline_budget({"mode": "count", "value": 3, "decision_ref": "PM-1"})
+        after = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        self.assertEqual(after["started_at"], before["started_at"])
+        self.assertEqual(after["known_runs"], before["known_runs"])
+        self.assertEqual(devflow.pipeline_check(self.repo)["consumed_count"], 1)
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 2)
+
+    def test_a_new_decision_starts_the_count_again(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 1, "decision_ref": "PM-1"})
+        self.consume_chain_task("#31")
+        self.assertFalse(devflow.pipeline_check(self.repo)["allowed"])
+        self.set_pipeline_budget({"mode": "count", "value": 1, "decision_ref": "PM-2"})
+        renewed = devflow.pipeline_check(self.repo)
+        self.assertTrue(renewed["allowed"])
+        self.assertEqual(renewed["consumed_count"], 0)
+
+    def test_pipeline_state_survives_a_restart_and_is_not_reset_silently(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        self.consume_chain_task("#31")
+        state = devflow.load_json(self.repo / devflow.PIPELINE_STATE_PATH)
+        self.assertEqual(state["decision_ref"], "PM-1")
+        # A later process reads the same state and the same count.
+        self.assertEqual(devflow.pipeline_check(self.repo)["consumed_count"], 1)
+        self.assertEqual(devflow.pipeline_check(self.repo)["remaining"], 1)
+
+    def test_hand_edited_budget_initializes_state_and_says_so(self):
+        self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["automation"]["pipeline"] = {"mode": "count", "value": 2, "decision_ref": "PM-9"}
+        (self.repo / devflow.CONFIG_PATH).write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        report = devflow.pipeline_check(self.repo)
+        self.assertTrue(report["state_initialized"])
+        self.assertIn("мимо CLI", report["note"])
+
+    def test_active_budget_makes_every_record_attributable(self):
+        self.apply_init()
+        # Without a budget the contract for a node outside any cycle is unchanged.
+        self.assertEqual(
+            devflow.record_run(
+                self.repo, "inspect_project", "FAIL", "", "", "", ["no issue"], None, None, None,
+            )["status"],
+            "PASS",
+        )
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "inspect_project", "FAIL", "", "", "", ["no issue"], None, None, None,
+            )
+        self.assertIn("Активен бюджет конвейера", str(context.exception))
+
+    def test_switching_back_to_manual_clears_the_budget_state(self):
+        self.apply_init()
+        self.set_pipeline_budget({"mode": "count", "value": 2, "decision_ref": "PM-1"})
+        self.assertTrue((self.repo / devflow.PIPELINE_STATE_PATH).is_file())
+        self.set_pipeline_budget({"mode": "manual"})
+        self.assertFalse((self.repo / devflow.PIPELINE_STATE_PATH).is_file())
+        self.assertFalse(devflow.pipeline_check(self.repo)["allowed"])
+
     def test_github_runbook_is_linked_and_matches_the_reported_gaps(self):
         root = Path(devflow.__file__).resolve().parent.parent
         runbook = root / "references" / "github-preparation.md"
