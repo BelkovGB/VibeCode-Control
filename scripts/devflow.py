@@ -119,6 +119,26 @@ CHECK_GATED_STAGES = {"verification", "review", "release"}
 # Artifact kinds a review node can be required to produce.
 REVIEW_ARTIFACT_KINDS = {"review", "comment", "findings", "report", "check-run"}
 GATE_ORIGINS = {"skill", "repository-policy", "risk-escalation"}
+# What a gate demands.  Only the two minimizable kinds answer "what to run"; the rest
+# answer "what to trust" and no change type or owner policy may remove them.
+GATE_KIND_NODE_CHECK = "node-check"
+GATE_KIND_QUALITY_COMMAND = "quality-command"
+MINIMIZABLE_GATE_KINDS = {GATE_KIND_NODE_CHECK, GATE_KIND_QUALITY_COMMAND}
+NON_MINIMIZABLE_GATE_KINDS = {
+    "merge-gate-invariant",
+    "evidence-artifact",
+    "cycle-budget",
+    "pipeline-budget",
+    "guarded-file-review",
+}
+MERGE_GATE_INVARIANTS = {"verified_head_sha", "required_checks_green"}
+# Three states that must never collapse into each other.
+GATE_REQUIRED_PROVEN = "required-and-proven"
+GATE_NOT_REQUIRED = "not-required-for-this-change"
+GATE_REQUIRED_UNPROVEN = "required-and-unproven"
+# Today every gate applies to the whole repository.  Monorepo zones will arrive as a
+# different value of this same field, so the attribution contract does not change.
+GATE_SCOPE_REPOSITORY = "repository"
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", "node_modules", "vendor",
     ".venv", "venv", "dist", "build", "coverage", ".next", ".turbo",
@@ -1690,6 +1710,41 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
                 errors.extend(effort_vocabulary_errors(
                     f"node_overrides.{node_id}", override_agent, parsed_override["effort"], registry
                 ))
+    plan = validation_plan_of(config)
+    if not isinstance(config.get("quality", {}).get("validation_plan", {}), dict):
+        errors.append("quality.validation_plan должен быть объектом")
+    github_required = config.get("github", {}).get("required_checks") if isinstance(config.get("github"), dict) else []
+    github_required = [str(item) for item in github_required] if isinstance(github_required, list) else []
+    for change_type, entry in sorted(plan.items()):
+        pointer = f"quality.validation_plan.{change_type}"
+        if not isinstance(entry, dict):
+            errors.append(f"{pointer} должен быть объектом")
+            continue
+        unknown = sorted(set(entry) - {"paths", "skip_checks", "reason"})
+        if unknown:
+            errors.append(f"{pointer} содержит неизвестные ключи: {', '.join(unknown)}")
+        paths = entry.get("paths")
+        if not isinstance(paths, list) or not paths or not all(
+            isinstance(item, str) and item.strip() for item in paths
+        ):
+            errors.append(f"{pointer}.paths обязателен: непустой список путей, определяющих тип изменения")
+        if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            errors.append(f"{pointer}.reason обязателен: исключение проверки объясняется, а не подразумевается")
+        skip = entry.get("skip_checks", [])
+        if not isinstance(skip, list) or not all(isinstance(item, str) for item in skip):
+            errors.append(f"{pointer}.skip_checks должен быть списком строк")
+            skip = []
+        for name in skip:
+            if name in MERGE_GATE_INVARIANTS:
+                errors.append(
+                    f"{pointer}.skip_checks: {name} — инвариант merge gate и не снимается "
+                    "никаким типом изменения"
+                )
+            if name in github_required:
+                errors.append(
+                    f"{pointer}.skip_checks: {name} требуется политикой репозитория "
+                    "(github.required_checks) и занижению не подлежит"
+                )
     _, pipeline_errors = parse_pipeline_budget(
         config.get("automation", {}).get("pipeline") if isinstance(config.get("automation"), dict) else None
     )
@@ -1933,6 +1988,18 @@ def validate_workflow(workflow: dict[str, Any], config: dict[str, Any]) -> tuple
                     f"Узел {node_id}: {field} задаётся в config.json через roles или node_overrides, "
                     "а не в графе; значение внутри узла молча игнорировалось бы"
                 )
+        # The third leg of the non-minimizable core: only the graph knows the artifact
+        # names, so the refusal to let a policy drop one has to live here.
+        for change_type, entry in sorted(validation_plan_of(config).items()):
+            skip = entry.get("skip_checks") if isinstance(entry, dict) else []
+            skip = [str(item) for item in skip] if isinstance(skip, list) else []
+            for name in sorted(set(skip) & set(contract)):
+                requirement = contract.get(name)
+                if isinstance(requirement, dict) and requirement.get("required", True):
+                    errors.append(
+                        f"quality.validation_plan.{change_type}.skip_checks: {name} — обязательный "
+                        f"артефакт узла {node_id} и не снимается никаким типом изменения"
+                    )
         # The executing-agent rule has to hold for the value that actually resolves, not
         # only for the role default: a node override can pair an executing agent with
         # `not-applicable`, or a non-executing agent with a real model.
@@ -1943,6 +2010,12 @@ def validate_workflow(workflow: dict[str, Any], config: dict[str, Any]) -> tuple
             # Nothing to cross-check until an executor is chosen; the roles setup stage
             # reports the pending decision.
             continue
+        effort_entry = resolution.get("effort", {})
+        errors.extend(effort_vocabulary_errors(
+            f"nodes.{node_id}", agent or "",
+            {"mode": effort_entry.get("mode"), "value": effort_entry.get("value")},
+            client_registry(config if isinstance(config, dict) else {}),
+        ))
         for field in TYPED_PROFILE_FIELDS:
             mode = resolution[field].get("mode")
             pointer = resolution[field].get("source", {}).get("pointer") or field
@@ -3885,7 +3958,8 @@ def guarded_control_plane_changes(repo: Path) -> dict[str, Any]:
     }
 
 
-def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision: str = "") -> dict[str, Any]:
+def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision: str = "",
+                      change_type: str = "") -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     config_errors, config_warnings = validate_config(config)
     workflow_errors, workflow_warnings = validate_workflow(workflow, config)
@@ -3953,6 +4027,7 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
         automation = config.get("automation", {}) if isinstance(config.get("automation", {}), dict) else {}
         if automation.get("background_workers") != "verified":
             external_gaps.append("Background executor availability is unverified")
+    validation_verdict = verify_change_type(repo, config, change_type)
     stage = nodes[node_id].get("stage")
     if stage in {"review", "release"}:
         github = config.get("github", {}) if isinstance(config.get("github", {}), dict) else {}
@@ -3975,6 +4050,8 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
         "cycle_budget": budget,
         "self_modification": guarded_control_plane_changes(repo),
         "required_artifacts": evidence_contract_for(nodes[node_id]),
+        "validation": validation_verdict,
+        "gates": gate_attribution(config, workflow, nodes[node_id], validation_verdict),
         "config": {"errors": config_errors, "warnings": config_warnings},
         "workflow": {"errors": workflow_errors, "warnings": workflow_warnings},
         "skills": skill_report,
@@ -4321,6 +4398,163 @@ def pipeline_check(repo: Path) -> dict[str, Any]:
     return response
 
 
+def validation_plan_of(config: Any) -> dict[str, Any]:
+    quality = config.get("quality") if isinstance(config, dict) else {}
+    quality = quality if isinstance(quality, dict) else {}
+    plan = quality.get("validation_plan")
+    return plan if isinstance(plan, dict) else {}
+
+
+def path_matches_change_type(relative: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern:
+            continue
+        if pattern.endswith("/"):
+            if relative.startswith(pattern):
+                return True
+        elif pattern.startswith("*"):
+            if relative.endswith(pattern[1:]):
+                return True
+        elif relative == pattern:
+            return True
+    return False
+
+
+def changed_paths_for_validation(repo: Path) -> dict[str, Any]:
+    """The paths this change actually touches, from the same base as guarded detection."""
+    report = guarded_control_plane_changes(repo)
+    base = report.get("merge_base")
+    paths: list[str] = []
+    available = bool(base)
+    if base:
+        code, names, _ = run_process(["git", "diff", "--name-only", base, "HEAD"], repo)
+        if code == 0:
+            paths.extend(line.strip() for line in names.splitlines() if line.strip())
+        else:
+            available = False
+    # An uncommitted change is still a change: it must not escape the comparison.
+    code, status, _ = run_process(["git", "status", "--porcelain=v1", "--untracked-files=all"], repo)
+    if code == 0:
+        for line in status.splitlines():
+            candidate = line[3:].strip().strip('"')
+            if candidate and candidate not in paths:
+                paths.append(candidate)
+    return {"base": report.get("base"), "merge_base": base, "available": available, "paths": sorted(paths)}
+
+
+def verify_change_type(repo: Path, config: Any, change_type: str | None) -> dict[str, Any]:
+    """Check a declared change type against the diff.  A claim alone grants nothing."""
+    plan = validation_plan_of(config)
+    claim = (change_type or "").strip()
+    changed = changed_paths_for_validation(repo)
+    verdict: dict[str, Any] = {
+        "claim": claim or None,
+        "base": changed["base"],
+        "changed_paths": changed["paths"],
+        "minimization": False,
+        "verified": False,
+        "note": None,
+    }
+    if not claim:
+        verdict["note"] = "Тип изменения не объявлен: применяется полный набор проверок"
+        return verdict
+    if not plan:
+        verdict["note"] = (
+            "Политика quality.validation_plan не настроена: минимизация выключена, "
+            "применяется полный набор проверок"
+        )
+        return verdict
+    if claim not in plan:
+        verdict["note"] = (
+            f"Тип изменения {claim} не объявлен в quality.validation_plan: "
+            "применяется полный набор проверок"
+        )
+        return verdict
+    if not changed["available"]:
+        verdict["note"] = (
+            "Базовая версия не определена локально: сверить объявление не с чем, "
+            "минимизация недоступна, применяется полный набор проверок"
+        )
+        return verdict
+    if not changed["paths"]:
+        verdict["note"] = (
+            "Изменений относительно базовой версии не видно: объявленный тип нечем подтвердить, "
+            "минимизация недоступна"
+        )
+        return verdict
+    patterns = plan[claim].get("paths") if isinstance(plan[claim], dict) else []
+    patterns = [str(item) for item in patterns] if isinstance(patterns, list) else []
+    unmatched = [item for item in changed["paths"] if not path_matches_change_type(item, patterns)]
+    verdict["unmatched_paths"] = unmatched
+    if unmatched:
+        verdict["note"] = (
+            f"Объявленный тип {claim} не подтверждён диффом: вне его путей — "
+            + ", ".join(unmatched[:10])
+        )
+        return verdict
+    verdict["verified"] = True
+    verdict["minimization"] = True
+    verdict["note"] = f"Тип {claim} подтверждён диффом"
+    return verdict
+
+
+def gate_attribution(config: Any, workflow: Any, node: dict[str, Any],
+                     verdict: dict[str, Any], observed: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Every gate of a node with its origin, scope and requirement state."""
+    observed = observed or {}
+    plan = validation_plan_of(config)
+    claim = verdict.get("claim")
+    skip = plan.get(claim, {}).get("skip_checks") if verdict.get("minimization") else []
+    skip = [str(item) for item in skip] if isinstance(skip, list) else []
+    reason = plan.get(claim, {}).get("reason") if verdict.get("minimization") else None
+    github = config.get("github") if isinstance(config, dict) else {}
+    github = github if isinstance(github, dict) else {}
+    required_checks = github.get("required_checks")
+    required_checks = [str(item) for item in required_checks] if isinstance(required_checks, list) else []
+    gates: list[dict[str, Any]] = []
+
+    def add(name: str, origin: str, kind: str, state: str, why: str) -> None:
+        gates.append({
+            "name": name,
+            "origin": origin,
+            "scope": GATE_SCOPE_REPOSITORY,
+            "kind": kind,
+            "requirement": state,
+            "reason": why,
+        })
+
+    for name in required_checks:
+        proven = observed.get(name) in PROVEN_CHECK_CONCLUSIONS
+        add(name, "repository-policy", "repository-check",
+            GATE_REQUIRED_PROVEN if proven else GATE_REQUIRED_UNPROVEN,
+            "Требование репозитория: занижению не подлежит")
+    for name in MERGE_GATE_INVARIANTS:
+        if node.get("state") == "MERGE_GATE":
+            add(name, "repository-policy", "merge-gate-invariant", GATE_REQUIRED_UNPROVEN,
+                "Инвариант merge gate: не снимается никаким типом изменения")
+    for name, requirement in sorted(evidence_contract_for(node).items()):
+        if isinstance(requirement, dict) and requirement.get("required", True):
+            add(name, "skill", "evidence-artifact", GATE_REQUIRED_UNPROVEN,
+                "Артефакт доверия: не снимается никаким типом изменения")
+    checks = node.get("checks") if isinstance(node.get("checks"), list) else []
+    for name in checks:
+        name = str(name)
+        if name in skip:
+            add(name, "skill", GATE_KIND_NODE_CHECK, GATE_NOT_REQUIRED,
+                f"Тип изменения {claim}: {reason or 'исключено политикой quality.validation_plan'}")
+        else:
+            add(name, "skill", GATE_KIND_NODE_CHECK, GATE_REQUIRED_UNPROVEN,
+                "Проверка узла графа")
+    risk = config.get("quality", {}).get("risk_profile") if isinstance(config.get("quality"), dict) else None
+    if isinstance(risk, str) and risk in {"high", "critical"}:
+        add(f"risk:{risk}", "risk-escalation", "risk-escalation", GATE_REQUIRED_UNPROVEN,
+            "Надбавка по классу риска: занижению не подлежит")
+    for gate in gates:
+        if gate["origin"] not in GATE_ORIGINS:
+            raise DevflowError(f"Неизвестное происхождение гейта {gate['name']}: {gate['origin']}")
+    return gates
+
+
 def parse_check_results(items: list[str] | None) -> dict[str, str]:
     """Parse `--check name=conclusion` pairs.  A job status alone proves nothing."""
     results: dict[str, str] = {}
@@ -4349,7 +4583,7 @@ def evidence_contract_for(node: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr: str,
                evidence: list[str], actual_agent: str | None, actual_model: str | None,
                actual_effort: str | None, checks: list[str] | None = None,
-               human_decision: str | None = None) -> dict[str, Any]:
+               human_decision: str | None = None, change_type: str | None = None) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     nodes = {item["id"]: item for item in workflow["nodes"]}
     if node not in nodes:
@@ -4361,6 +4595,7 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
     if not evidence or not all(isinstance(item, str) and item.strip() for item in evidence):
         raise DevflowError("Run record требует хотя бы одно непустое доказательство")
     check_results = parse_check_results(checks)
+    validation_verdict = verify_change_type(repo, config, change_type)
     registry = client_registry(config)
     observed_client = client_for_agent(actual_agent, registry) or client_for_agent(
         effective.get("resolution", {}).get("agent", {}).get("value"), registry
@@ -4474,7 +4709,7 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                         f"Доказательство {name} ссылается на refs/pull/<N>/merge; "
                         "post-merge проверка не запускается на закрытом PR"
                     )
-        preflight = operate_preflight(repo, node, issue, decision)
+        preflight = operate_preflight(repo, node, issue, decision, change_type or "")
         if preflight["status"] != "PASS":
             reasons = (
                 preflight.get("external_gaps", [])
@@ -4568,6 +4803,8 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
         "evidence": evidence,
         "evidence_by_name": evidence_by_name,
         "checks": check_results,
+        "validation": validation_verdict,
+        "gates": gate_attribution(config, workflow, nodes[node], validation_verdict, check_results),
         "verification_level": (
             "local-head-and-preflight-verified; artifact references recorded, remote artifacts remain enforced by their adapters"
             if status == "PASS" and stage in {"implementation", "verification", "review", "release"}
@@ -4869,6 +5106,7 @@ def build_parser() -> argparse.ArgumentParser:
     operate = sub.add_parser("operate", help="Preflight one configured workflow node")
     operate.add_argument("--node", required=True)
     operate.add_argument("--issue", default="", help="Issue reference; required to evaluate a cycle budget")
+    operate.add_argument("--change-type", default="", help="Declared change type, verified against the diff")
     operate.add_argument(
         "--human-decision",
         default="",
@@ -4888,6 +5126,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_record.add_argument("--actual-agent")
     run_record.add_argument("--actual-model")
     run_record.add_argument("--actual-effort")
+    run_record.add_argument(
+        "--change-type",
+        default="",
+        help="Declared change type; the minimal plan applies only when the diff confirms it",
+    )
     run_record.add_argument(
         "--human-decision",
         default="",
@@ -5166,7 +5409,7 @@ def execute(args: argparse.Namespace) -> int:
         print_json({"status": status, "applied": bool(args.apply), "clients": reports})
         return 0 if status == "PASS" else 1
     if args.command == "operate":
-        result = operate_preflight(repo, args.node, args.issue, args.human_decision)
+        result = operate_preflight(repo, args.node, args.issue, args.human_decision, args.change_type)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
     if args.command == "run":
@@ -5174,7 +5417,7 @@ def execute(args: argparse.Namespace) -> int:
             print_json(record_run(
                 repo, args.node, args.status, args.head_sha, args.issue, args.pr, args.evidence,
                 args.actual_agent, args.actual_model, args.actual_effort, args.check,
-                args.human_decision,
+                args.human_decision, args.change_type,
             ))
             return 0
         if args.run_command == "show":
