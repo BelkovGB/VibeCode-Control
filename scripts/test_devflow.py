@@ -2387,6 +2387,61 @@ class DevflowTestCase(unittest.TestCase):
         self.assertEqual(report["bindings"]["implementer_review"], "impl-chat")
         self.assertEqual(report["bindings"]["final_review"], "review-chat")
 
+    def test_a_role_of_another_client_cannot_be_bound_to_a_session(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code", implementer_agent="codex")
+        with self.assertRaises(devflow.DevflowError) as context:
+            self.declare_sessions()
+        message = str(context.exception)
+        self.assertIn("automation.sessions.roles.implementer", message)
+        self.assertIn("принадлежит клиенту codex", message)
+        # A non-executing agent is refused for the same reason, one floor earlier than
+        # the run record would catch it.
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["automation"]["sessions"] = {
+            "mode": "explicit", "client": "claude",
+            "roles": {"human-pm": {"mode": "explicit", "session": "pm-chat"}},
+        }
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("не получает постановок" in item for item in errors))
+
+    def test_an_unresolved_role_may_still_be_bound_to_a_session(self):
+        self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(config["roles"]["implementer"]["agent"], "unresolved")
+        self.declare_sessions()
+        report = devflow.session_report(
+            self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH),
+            devflow.load_json(self.repo / devflow.WORKFLOW_PATH))
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["bindings"]["implement"], "impl-chat")
+
+    def test_a_non_executing_role_is_not_asked_about_a_session(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code")
+        self.declare_sessions()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        workflow = devflow.load_json(self.repo / devflow.WORKFLOW_PATH)
+        report = devflow.session_report(self.repo, config, workflow)
+        self.assertIn("human-pm", report["derived_not_applicable"])
+        self.assertFalse(any(item["pointer"].endswith("human-pm") for item in report["pending"]))
+        # Derived, not written: the configuration still holds no entry for the role.
+        self.assertNotIn("human-pm", config["automation"]["sessions"].get("roles", {}))
+
+    def test_giving_a_human_role_an_executing_agent_brings_the_question_back(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code")
+        self.declare_sessions()
+        devflow.configure_value(self.repo, "roles.human-pm", json.dumps({
+            "agent": "claude-code", "model": {"mode": "explicit", "value": "verified-model"},
+            "effort": {"mode": "explicit", "value": "high"}, "permissions": "human-approval",
+        }))
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        report = devflow.session_report(
+            self.repo, config, devflow.load_json(self.repo / devflow.WORKFLOW_PATH))
+        self.assertNotIn("human-pm", report["derived_not_applicable"])
+        self.assertTrue(any(item["pointer"].endswith("human-pm") for item in report["pending"]))
+
     def test_assign_refuses_a_manual_budget_without_a_named_pm_go(self):
         self.apply_init()
         self.declare_sessions()

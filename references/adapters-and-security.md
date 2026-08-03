@@ -51,6 +51,8 @@ devflow config set automation.sessions.roles.implementer '{"mode": "explicit", "
 devflow config set automation.sessions.roles.reviewer '{"mode": "explicit", "session": "<chat name>"}'
 ```
 
+The registry is checked against the roles it names. A role whose agent belongs to a different client cannot be bound to this transport's sessions, and neither can a role whose agent executes no model — both are refused at write time with the exact pointer, instead of surfacing later as a mismatched `actual_agent` in a run record. A role whose executor is still `unresolved` may be bound; that decision is already pending on the `roles` stage. Roles executed by `human`, `script`, or `deterministic` are never asked about a session, because an agent that executes no model receives no assignment here by definition.
+
 A role this project does not execute through a session is `{"mode": "not-applicable"}`. A project that runs no sessions at all declares `automation.sessions` as `{"mode": "not-applicable"}`. The shipped template declares `{"mode": "undecided"}` and chooses nothing, so the `automation` setup stage asks. Run `devflow session check` to see the resolved node → session bindings, and `devflow doctor` to see the same as one finding.
 
 ### Assign a node

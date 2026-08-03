@@ -4928,11 +4928,41 @@ def session_transport_errors(config: Any) -> list[str]:
         errors.append(
             f"automation.sessions.roles.{role}: роль не объявлена в config.roles"
         )
+    transport_client = client.strip() if isinstance(client, str) else ""
     for role in sorted(declared_roles):
-        _, role_errors = parse_session_role(
-            declared_roles[role], f"automation.sessions.roles.{role}")
+        pointer = f"automation.sessions.roles.{role}"
+        entry, role_errors = parse_session_role(declared_roles[role], pointer)
         errors.extend(role_errors)
+        if entry.get("mode") != MODE_EXPLICIT or role not in configured_roles:
+            continue
+        # Catch the mismatch one floor earlier than the run record does: an agent of
+        # another client cannot execute in this client's chat, and an agent that
+        # executes no model receives no assignment at all.  `unresolved` is left alone
+        # — the roles stage already carries that pending decision.
+        agent = role_agent(config, role)
+        if not agent or agent == AGENT_UNRESOLVED:
+            continue
+        if agent in NON_EXECUTING_AGENTS:
+            errors.append(
+                f"{pointer}: агент {agent} не исполняет модель и не получает постановок "
+                f"через транспорт сессий; допустим только mode={MODE_NOT_APPLICABLE}"
+            )
+            continue
+        agent_client = client_for_agent(agent, registry)
+        if transport_client and agent_client and agent_client != transport_client:
+            errors.append(
+                f"{pointer}: агент {agent} принадлежит клиенту {agent_client}, "
+                f"а транспорт объявлен для {transport_client}; сессия чужого клиента "
+                "его не исполнит"
+            )
     return errors
+
+
+def role_agent(config: Any, role: Any) -> str:
+    roles = config.get("roles") if isinstance(config, dict) else {}
+    settings = roles.get(role) if isinstance(roles, dict) else None
+    agent = settings.get("agent") if isinstance(settings, dict) else None
+    return agent.strip() if isinstance(agent, str) else ""
 
 
 def session_for_node(node: Any, config: Any) -> dict[str, Any]:
@@ -4941,11 +4971,23 @@ def session_for_node(node: Any, config: Any) -> dict[str, Any]:
     role = node.get("role") if isinstance(node, dict) else None
     entry = transport["roles"].get(role) if isinstance(role, str) else None
     entry = entry if isinstance(entry, dict) else {"mode": MODE_UNDECIDED}
+    agent = role_agent(config, role)
+    mode = entry.get("mode", MODE_UNDECIDED)
+    derived = False
+    if mode == MODE_UNDECIDED and agent in NON_EXECUTING_AGENTS:
+        # An agent that executes no model receives no assignment through this
+        # transport by definition.  That is a fact the engine knows, so it is derived
+        # here instead of being asked of the owner and written into the configuration.
+        # `unresolved` is not such a fact: nobody has chosen an executor yet.
+        mode = MODE_NOT_APPLICABLE
+        derived = True
     return {
         "transport_mode": transport["mode"],
         "client": transport.get("client"),
         "role": role,
-        "mode": entry.get("mode", MODE_UNDECIDED),
+        "agent": agent,
+        "mode": mode,
+        "derived": derived,
         "session": entry.get("session"),
         "pointer": f"automation.sessions.roles.{role}",
     }
@@ -4994,6 +5036,7 @@ def session_report(repo: Path, config: Any, workflow: Any) -> dict[str, Any]:
     errors = session_transport_errors(config)
     pending = pending_session_decisions(config, workflow)
     bindings: dict[str, Any] = {}
+    derived: list[str] = []
     nodes = workflow.get("nodes") if isinstance(workflow, dict) else []
     for node in nodes if isinstance(nodes, list) else []:
         if not isinstance(node, dict) or not isinstance(node.get("id"), str):
@@ -5001,6 +5044,8 @@ def session_report(repo: Path, config: Any, workflow: Any) -> dict[str, Any]:
         resolved = session_for_node(node, config)
         if resolved["mode"] == MODE_EXPLICIT:
             bindings[node["id"]] = resolved["session"]
+        elif resolved["derived"] and resolved["role"] not in derived:
+            derived.append(str(resolved["role"]))
     status = "BLOCKED" if errors else ("PARTIAL" if pending else "PASS")
     if transport["mode"] == MODE_NOT_APPLICABLE:
         status = "BLOCKED" if errors else "NOT_APPLICABLE"
@@ -5010,6 +5055,7 @@ def session_report(repo: Path, config: Any, workflow: Any) -> dict[str, Any]:
         "mode": transport["mode"],
         "client": transport.get("client"),
         "bindings": bindings,
+        "derived_not_applicable": sorted(derived),
         "errors": errors,
         "pending": pending,
         "liveness": SESSION_LIVENESS_NOTE,
