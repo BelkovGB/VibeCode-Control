@@ -1424,6 +1424,54 @@ class DevflowTestCase(unittest.TestCase):
         self.assertTrue(any("Бюджет цикла" in gap and "Stall control" in gap
                             for gap in exhausted["external_gaps"]))
 
+    def spend_the_cycle_budget(self, issue="#21"):
+        """Burn the correction-loop budget on a project that could otherwise deliver."""
+        self.prepare_verified_delivery_state(required_checks=())
+        for node in ["quality_gates", "implementer_review", "final_review",
+                     "fix_findings", "quality_gates", "implementer_review", "final_review",
+                     "fix_findings", "quality_gates", "implementer_review", "final_review"]:
+            self.record_cycle_attempt(node, issue=issue)
+        self.assertTrue(self.cycle_traversals(issue=issue)["exhausted"])
+        return self.commit_worktree()
+
+    def test_pm_decision_lets_the_recovery_traversal_finish_successfully(self):
+        self.apply_init()
+        head = self.spend_the_cycle_budget()
+        recorded = devflow.record_run(
+            self.repo, "fix_findings", "PASS", head, "#21", "PR-1",
+            ["root cause=doc://rc", "regression test=ci://t", f"new head SHA={head}"],
+            "codex", "verified-model", "high", [], "issue-comment://pm-90",
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["human_decision"], "issue-comment://pm-90")
+        self.assertTrue(stored["cycle_budget"]["exhausted"])
+        self.assertEqual(stored["cycle_budget"]["traversals"], 2)
+
+    def test_exhausted_budget_still_refuses_a_pass_without_a_decision(self):
+        self.apply_init()
+        head = self.spend_the_cycle_budget()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "fix_findings", "PASS", head, "#21", "PR-1",
+                ["root cause=doc://rc", "regression test=ci://t", f"new head SHA={head}"],
+                "codex", "verified-model", "high", [], None,
+            )
+        self.assertIn("Бюджет цикла", str(context.exception))
+
+    def test_operate_accepts_the_decision_and_reports_the_override(self):
+        self.apply_init()
+        self.spend_the_cycle_budget()
+        blocked = devflow.operate_preflight(self.repo, "fix_findings", "#21")
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIsNone(blocked["cycle_budget"].get("override_ref"))
+        allowed = devflow.operate_preflight(self.repo, "fix_findings", "#21", "issue-comment://pm-90")
+        self.assertNotEqual(allowed["status"], "BLOCKED")
+        self.assertEqual(allowed["cycle_budget"]["override_ref"], "issue-comment://pm-90")
+        # The reference authorizes a step; it never resets the budget.
+        self.assertTrue(allowed["cycle_budget"]["exhausted"])
+        self.assertEqual(allowed["cycle_budget"]["remaining"], 0)
+
     def test_max_fix_cycles_above_the_ceiling_requires_a_named_decision(self):
         kit = devflow.find_project_kit(self.repo)
         config = devflow.load_json(kit / "config.json")

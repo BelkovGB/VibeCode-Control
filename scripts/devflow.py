@@ -3662,7 +3662,7 @@ def guarded_control_plane_changes(repo: Path) -> dict[str, Any]:
     }
 
 
-def operate_preflight(repo: Path, node_id: str, issue: str = "") -> dict[str, Any]:
+def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision: str = "") -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     config_errors, config_warnings = validate_config(config)
     workflow_errors, workflow_warnings = validate_workflow(workflow, config)
@@ -3703,12 +3703,19 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "") -> dict[str, An
                 f"Параметр {pointer} не выбран (mode={MODE_UNDECIDED}); "
                 "объявите значение, наследование или явное отсутствие"
             )
-    # Preventive layer: an exhausted cycle must not start another traversal at all.
+    # Preventive layer: an exhausted cycle must not start another traversal at all —
+    # unless a PM decision has already been made, in which case the recovery path
+    # (stop-check, decision, finish the traversal) has to stay open.
     budget = None
+    override_ref = human_decision.strip() if isinstance(human_decision, str) else ""
     if declared_cycle_for_node(workflow, node_id) is not None:
         if normalize_issue_key(issue):
             budget = cycle_budget(repo, workflow, node_id, issue)
-            if budget["exhausted"]:
+            if override_ref:
+                # The reference neither resets the budget nor raises max_traversals: it
+                # authorizes this step only, and every later one must name it again.
+                budget["override_ref"] = override_ref
+            if budget["exhausted"] and not override_ref:
                 external_blockers.append(
                     f"Бюджет цикла {budget['cycle']} исчерпан для Issue {issue}: "
                     f"пройдено {budget['traversals']} из {budget['max_traversals']}. "
@@ -4073,7 +4080,7 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                         f"Доказательство {name} ссылается на refs/pull/<N>/merge; "
                         "post-merge проверка не запускается на закрытом PR"
                     )
-        preflight = operate_preflight(repo, node, issue)
+        preflight = operate_preflight(repo, node, issue, decision)
         if preflight["status"] != "PASS":
             reasons = (
                 preflight.get("external_gaps", [])
@@ -4451,6 +4458,12 @@ def build_parser() -> argparse.ArgumentParser:
     operate = sub.add_parser("operate", help="Preflight one configured workflow node")
     operate.add_argument("--node", required=True)
     operate.add_argument("--issue", default="", help="Issue reference; required to evaluate a cycle budget")
+    operate.add_argument(
+        "--human-decision",
+        default="",
+        metavar="REF",
+        help="Reference to the PM decision that authorizes continuing past a spent cycle budget",
+    )
 
     run = sub.add_parser("run", help="Record or inspect background run evidence")
     run_sub = run.add_subparsers(dest="run_command", required=True)
@@ -4738,7 +4751,7 @@ def execute(args: argparse.Namespace) -> int:
         print_json({"status": status, "applied": bool(args.apply), "clients": reports})
         return 0 if status == "PASS" else 1
     if args.command == "operate":
-        result = operate_preflight(repo, args.node, args.issue)
+        result = operate_preflight(repo, args.node, args.issue, args.human_decision)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
     if args.command == "run":

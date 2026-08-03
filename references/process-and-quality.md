@@ -162,7 +162,7 @@ A traversal is a re-entry, not a visit. Nodes on the main path are recorded once
 
 Enforcement has two layers. `devflow operate --node <node> --issue <ref>` reports the traversals and the remainder, and turns `BLOCKED` once the budget is spent, so another traversal never starts. `devflow run record` keeps a per-node cap as a backstop: a record of a node already stored `max_traversals + 1` times is refused. The cap is per node rather than global on purpose — the review tail of the last legal traversal is written after the traversal count has already reached its maximum, and must remain recordable.
 
-Extending a spent budget is possible only through `devflow run record --human-decision <ref>`, a non-empty reference to the PM decision that is stored in the run record. There is no silent extension.
+Extending a spent budget is possible only through `--human-decision <ref>`, a non-empty reference to the PM decision. `devflow run record` stores it in the run record, and `devflow operate` accepts the same flag so the coordinator can proceed after the decision instead of being stopped by the preventive layer. The reference neither resets the budget nor raises `max_traversals`: it authorizes one step, the budget stays reported as spent with the reference beside it, and every later step must name it again. There is no silent extension.
 
 Every record of a node inside a declared cycle requires `--issue`, for every status: a stop that is not attributed to an Issue is as useless as an attempt that is not.
 
