@@ -41,20 +41,39 @@
       "timeout_minutes": 30
     },
     {
+      "id": "design",
+      "stage": "planning",
+      "state": "DESIGNING",
+      "entry_condition": "scope.approved",
+      "action": "produce_architecture_decision_and_test_specification",
+      "role": "architect",
+      "permissions": "read-and-propose",
+      "competencies": ["solution design", "architecture impact assessment", "test specification"],
+      "inputs": ["approved scope", "inspection report", "architecture", "canonical documents"],
+      "expected_evidence": ["design decision", "test spec", "issue draft"],
+      "checks": [
+        "no unresolved product choice",
+        "ADR recorded when architecture impact is real",
+        "proposal is proportional to the project"
+      ],
+      "timeout_minutes": 45
+    },
+    {
       "id": "prepare_issue",
       "stage": "planning",
       "state": "PREPARING_ISSUE",
-      "entry_condition": "scope.approved",
+      "entry_condition": "design.complete",
       "action": "prepare_ready_issue_and_risk_based_checks",
       "role": "product-lead",
       "permissions": "github-issue-write",
       "competencies": ["issue decomposition", "acceptance criteria", "risk classification"],
-      "inputs": ["roadmap", "architecture", "product rules"],
+      "inputs": ["roadmap", "architecture", "product rules", "design decision"],
       "expected_evidence": ["ready issue", "acceptance-to-check map", "architecture impact decision"],
       "checks": [
         "definition of ready",
         "one issue one branch one PR",
-        "scope covers one feature or an explicitly bounded small batch in one place"
+        "scope covers one feature or an explicitly bounded small batch in one place",
+        "architecture impact references the design decision instead of being made here"
       ],
       "timeout_minutes": 45
     },
@@ -249,8 +268,10 @@
   ],
   "edges": [
     {"from": "inspect_project", "to": "product_scope_gate", "condition": "inspection.complete", "max_retries": 0, "on_failure": "blocked"},
-    {"from": "product_scope_gate", "to": "prepare_issue", "condition": "scope.approved", "max_retries": 0, "on_failure": "human_needed"},
+    {"from": "product_scope_gate", "to": "design", "condition": "scope.approved", "max_retries": 0, "on_failure": "human_needed"},
     {"from": "product_scope_gate", "to": "human_needed", "condition": "scope.decision_required", "max_retries": 0, "on_failure": "human_needed"},
+    {"from": "design", "to": "prepare_issue", "condition": "design.complete", "max_retries": 1, "on_failure": "human_needed"},
+    {"from": "design", "to": "human_needed", "condition": "design.decision_required", "max_retries": 0, "on_failure": "human_needed"},
     {"from": "prepare_issue", "to": "skill_preflight", "condition": "issue.ready", "max_retries": 1, "on_failure": "human_needed"},
     {"from": "skill_preflight", "to": "tdd_red", "condition": "skills.verified", "max_retries": 1, "on_failure": "blocked"},
     {"from": "tdd_red", "to": "implement", "condition": "red.proven", "max_retries": 2, "on_failure": "human_needed"},

@@ -52,6 +52,10 @@ An Issue is ready only if it contains:
 - no unresolved product choice;
 - no conflict with active work.
 
+The architecture-impact decision is not made while writing the Issue. The graph has a `design` node between the scope gate and Issue preparation: the architect produces the design decision (an ADR when the architecture impact is real), the test specification, and the Issue draft, and Issue preparation packages that output. Its check requires the architecture-impact entry to reference the design artifact rather than to invent one, so the same decision is not taken twice in two places.
+
+Design produces a proposal, never a product decision. When designing surfaces a choice that the approved scope does not cover, the node routes to `human_needed` under `design.decision_required` — the same way the scope gate already routes an unapproved product question. There is no return edge into the scope gate: the PM answers, and the run starts again with an approved scope.
+
 Use one Issue, one branch, and one PR. Use `Closes #N` only for complete delivery and `Related to #N` for an explicitly accepted partial split.
 
 Size an Issue around one feature or one decision. Decompose larger work until each part is ready on its own; a piece that cannot reach Definition of Ready without carrying several unrelated decisions is not one Issue.
