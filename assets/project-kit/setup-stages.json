@@ -20,53 +20,60 @@
       "number": 2,
       "title": "Роли и модели",
       "purpose": "Проверить роли, агентов, модели, effort и permission-профили.",
+      "next_command": "devflow setup check --stage workspaces"
+    },
+    {
+      "id": "workspaces",
+      "number": 3,
+      "title": "Рабочие каталоги",
+      "purpose": "Зафиксировать роли каталогов: где живёт управляющий слой, где идёт работа по Issue и где хранится временное.",
       "next_command": "devflow setup check --stage graph"
     },
     {
       "id": "graph",
-      "number": 3,
+      "number": 4,
       "title": "Граф",
       "purpose": "Проверить узлы, рёбра, bounded retries и ветки BLOCKED/HUMAN_NEEDED.",
       "next_command": "devflow setup check --stage documentation"
     },
     {
       "id": "documentation",
-      "number": 4,
+      "number": 5,
       "title": "Документация",
       "purpose": "Назначить канонических владельцев информации и проверить архитектурную документацию.",
       "next_command": "devflow setup check --stage git-github"
     },
     {
       "id": "git-github",
-      "number": 5,
+      "number": 6,
       "title": "Git и GitHub",
       "purpose": "Проверить локальный Git отдельно от удалённых rulesets и required checks.",
       "next_command": "devflow setup check --stage quality"
     },
     {
       "id": "quality",
-      "number": 6,
+      "number": 7,
       "title": "Качество",
       "purpose": "Измерить baseline и настроить risk-based тесты, CI и пакет доказательств.",
       "next_command": "devflow setup check --stage skills"
     },
     {
       "id": "skills",
-      "number": 7,
+      "number": 8,
       "title": "Скиллы",
       "purpose": "Принять явное решение по дополнительным скиллам для каждого активного узла.",
       "next_command": "devflow skills recommend"
     },
     {
       "id": "automation",
-      "number": 8,
+      "number": 9,
       "title": "Автоматизация",
       "purpose": "Проверить доставку конфигурации и скиллов фоновым Claude/Codex, CI и уведомления.",
       "next_command": "devflow setup check --stage pilot"
     },
     {
       "id": "pilot",
-      "number": 9,
+      "number": 10,
       "title": "Пилот",
       "purpose": "Прогнать одну небольшую реальную Issue через всю схему и проверить доказательства.",
       "next_command": "devflow doctor --deep"

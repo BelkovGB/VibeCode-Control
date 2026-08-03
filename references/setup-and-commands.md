@@ -222,6 +222,8 @@ Keep that order: `config normalize --apply` for the typed model and effort, `gra
 
 `upgrade --apply` then regenerates the role-aware managed blocks from the installed roles and the project CLI. Confirm with `devflow doctor` that `config` and `graph` have no warnings and `managed-blocks` is `PASS`.
 
+It also refreshes `.agent-flow/setup-stages.json`, so a setup stage this skill added after the project was installed becomes part of `setup`. Until that runs, the diagnostic commands stay usable instead of failing on the missing stage: `setup check`, `setup next`, and `doctor` still report every stage this CLI evaluates, and a stage the installed definitions do not declare is reported as `PARTIAL` with the gap “Определения этапов устарели (нет `<stage>`)” and `devflow upgrade` as its next command.
+
 ## Windows examples
 
 From PowerShell in the project root:
@@ -246,6 +248,7 @@ Use `python3 .agent-flow/devflow.py ...` on Linux and macOS. Do not tell the use
 | Untyped model or effort | Configuration predates the typed execution contract | Run `config normalize`, review the diff, then `--apply` |
 | Effective-configuration drift | Files on disk do not match the approved matrix | Apply was rolled back and `verify` is BLOCKED; fix the configuration and build a new plan |
 | Stale or missing managed block | Instructions no longer match the configured roles | Run `devflow upgrade --apply`, then re-check `doctor` |
+| Stage definitions older than the CLI | `.agent-flow/setup-stages.json` predates a stage this skill added; `setup` and `doctor` keep working and mark the stage `PARTIAL` | Run `devflow upgrade`, review the diff, then `--apply` |
 | Contracted review artifact missing | A green run is not a passed review | Record the artifact as `<name>=<kind>:<reference>` or keep the node below PASS |
 | Review node declares no required artifact | Graph predates the review-artifact contract; validation warns and `run record` refuses PASS | Run `devflow graph --migrate`, review the diff, then `--apply` |
 | Unresolved node skill decision | Background prompt is incomplete | Review the node matrix and accept skill or zero-skill |
