@@ -52,11 +52,47 @@
     "models": {"type": "object"},
     "quality": {"type": "object"},
     "github": {"type": "object"},
-    "automation": {"type": "object"},
+    "automation": {
+      "type": "object",
+      "properties": {"pipeline": {"$ref": "#/$defs/pipelineBudget"}},
+      "additionalProperties": true
+    },
     "telemetry": {"type": "object"}
   },
   "additionalProperties": true,
   "$defs": {
+    "pipelineBudget": {
+      "title": "Autonomous chain budget",
+      "description": "Bounds how many tasks the coordinator may run in a row. `manual` runs nothing autonomously and is the shipped default. `count` and `until` are PM decisions and therefore require a non-empty decision_ref; changing the mode or value under the same reference is refused as a silent extension.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {"mode": {"const": "manual"}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "value", "decision_ref"],
+          "properties": {
+            "mode": {"const": "count"},
+            "value": {"type": "integer", "minimum": 1},
+            "decision_ref": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "value", "decision_ref"],
+          "properties": {
+            "mode": {"const": "until"},
+            "value": {"type": "string", "minLength": 1},
+            "decision_ref": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "typedParameter": {
       "title": "Typed execution parameter",
       "description": "A model or effort parameter always states its mode. `undecided` means nobody has chosen yet and is what the neutral template ships; it blocks setup and execution. `unset` means the project owner decided the parameter is absent; it does not block. Neither is ever materialized into a concrete value. A bare string is the legacy spelling, accepted on read and normalized on write.",

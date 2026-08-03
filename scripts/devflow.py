@@ -1569,6 +1569,10 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
                 if field in settings:
                     _, field_errors = parse_profile_value(settings[field], f"node_overrides.{node_id}.{field}")
                     errors.extend(field_errors)
+    _, pipeline_errors = parse_pipeline_budget(
+        config.get("automation", {}).get("pipeline") if isinstance(config.get("automation"), dict) else None
+    )
+    errors.extend(pipeline_errors)
     for field in ["quality", "github", "automation", "telemetry"]:
         if field in config and not isinstance(config[field], dict):
             errors.append(f"config.{field} должен быть объектом")
@@ -2967,7 +2971,19 @@ def configure_value(repo: Path, dotted: str, raw: str) -> dict[str, Any]:
         parts = dotted.split(".")
         target = parts[1] if len(parts) > 1 else ""
         mark_skill_revalidation(config, workflow, lock, target)
-    return apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "config-set")
+    result = apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "config-set")
+    if dotted == "automation.pipeline" or dotted.startswith("automation.pipeline."):
+        # The command that sets the budget is the honest place to stamp its start:
+        # a coordinator cannot forget a step that is the same action.
+        budget = pipeline_budget_of(config)
+        result["pipeline_state"] = (
+            write_pipeline_state(repo, budget) if budget["mode"] != "manual" else None
+        )
+        if budget["mode"] == "manual":
+            state_path = ensure_within(repo, PIPELINE_STATE_PATH)
+            if state_path.is_file():
+                state_path.unlink()
+    return result
 
 
 def configure_role(repo: Path, role: str, agent: str) -> dict[str, Any]:
@@ -3939,6 +3955,165 @@ def cycle_budget(repo: Path, workflow: Any, node_id: str, issue: str) -> dict[st
     }
 
 
+PIPELINE_STATE_PATH = f"{LOCAL_DIR}/pipeline-state.json"
+PIPELINE_MODES = {"manual", "count", "until"}
+
+
+def parse_pipeline_budget(raw: Any) -> tuple[dict[str, Any], list[str]]:
+    """Parse the autonomous-chain budget.  Absent means manual, which runs nothing."""
+    errors: list[str] = []
+    if raw is None:
+        return {"mode": "manual"}, errors
+    if not isinstance(raw, dict):
+        return {"mode": "manual"}, ["automation.pipeline должен быть объектом с полем mode"]
+    unknown = sorted(set(raw) - {"mode", "value", "decision_ref"})
+    if unknown:
+        errors.append(f"automation.pipeline содержит неизвестные ключи: {', '.join(unknown)}")
+    mode = raw.get("mode")
+    if mode not in PIPELINE_MODES:
+        return {"mode": "manual"}, errors + [
+            "automation.pipeline.mode должен быть одним из: " + ", ".join(sorted(PIPELINE_MODES))
+        ]
+    if mode == "manual":
+        if raw.get("value") is not None:
+            errors.append("automation.pipeline.value недопустим при mode=manual")
+        return {"mode": "manual"}, errors
+    decision_ref = raw.get("decision_ref")
+    if not isinstance(decision_ref, str) or not decision_ref.strip():
+        errors.append(
+            f"automation.pipeline.decision_ref обязателен при mode={mode}: "
+            "бюджет цепочки — решение PM, у решения есть ссылка"
+        )
+        decision_ref = ""
+    value = raw.get("value")
+    if mode == "count":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            errors.append("automation.pipeline.value при mode=count должен быть целым числом не меньше 1")
+            value = 1
+    else:
+        if not isinstance(value, str) or not value.strip():
+            errors.append("automation.pipeline.value при mode=until должен быть ссылкой на контрольную задачу")
+            value = ""
+        else:
+            value = value.strip()
+    return {"mode": mode, "value": value, "decision_ref": decision_ref.strip()}, errors
+
+
+def pipeline_budget_of(config: Any) -> dict[str, Any]:
+    automation = config.get("automation") if isinstance(config, dict) else {}
+    automation = automation if isinstance(automation, dict) else {}
+    budget, _ = parse_pipeline_budget(automation.get("pipeline"))
+    return budget
+
+
+def write_pipeline_state(repo: Path, budget: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the start of a budget.  Written by whatever sets the budget.
+
+    The boundary is the set of run records that already exist, not a timestamp:
+    `iso_now` has whole-second precision, so a task recorded in the same second as the
+    grant would otherwise be charged to the new budget.
+    """
+    state = {
+        "schema_version": 1,
+        "decision_ref": budget.get("decision_ref", ""),
+        "mode": budget.get("mode"),
+        "value": budget.get("value"),
+        "started_at": iso_now(),
+        "known_runs": sorted(
+            str(record.get("run_id")) for record in iter_run_records(repo) if record.get("run_id")
+        ),
+    }
+    atomic_write(ensure_within(repo, PIPELINE_STATE_PATH), json_bytes(state))
+    return state
+
+
+def pipeline_check(repo: Path) -> dict[str, Any]:
+    """Answer whether the coordinator may start another task on the current budget."""
+    config = load_json(repo / CONFIG_PATH)
+    automation = config.get("automation") if isinstance(config, dict) else {}
+    automation = automation if isinstance(automation, dict) else {}
+    budget, errors = parse_pipeline_budget(automation.get("pipeline"))
+    locality = "Счёт ведётся по локальной истории этого checkout."
+    if errors:
+        return {
+            "status": "BLOCKED", "allowed": False, "budget": budget, "errors": errors,
+            "reason": "Бюджет конвейера настроен некорректно: " + "; ".join(errors),
+        }
+    if budget["mode"] == "manual":
+        return {
+            "status": "BLOCKED", "allowed": False, "budget": budget, "consumed": [], "errors": [],
+            "reason": "Автоцепочка выключена: каждая задача стартует по явному го PM.",
+        }
+
+    state_path = repo / PIPELINE_STATE_PATH
+    state = load_json(state_path) if state_path.is_file() else None
+    initialized = False
+    if not isinstance(state, dict) or state.get("decision_ref") != budget["decision_ref"]:
+        # A new decision is a new budget: the count starts again, and there is no
+        # separate reset command by construction.
+        state = write_pipeline_state(repo, budget)
+        initialized = True
+    elif state.get("mode") != budget["mode"] or state.get("value") != budget["value"]:
+        return {
+            "status": "BLOCKED", "allowed": False, "budget": budget, "errors": [],
+            "reason": (
+                "Бюджет изменён без нового решения — укажите новый decision_ref. "
+                f"Записано было mode={state.get('mode')} value={state.get('value')}, "
+                f"сейчас mode={budget['mode']} value={budget['value']}. {locality}"
+            ),
+        }
+
+    started_at = str(state.get("started_at") or "")
+    known = set(state.get("known_runs") or [])
+    consumed: list[str] = []
+    for record in iter_run_records(repo):
+        if str(record.get("run_id")) in known:
+            continue
+        key = record.get("issue_key") or normalize_issue_key(record.get("issue"))
+        if key and key not in consumed:
+            consumed.append(key)
+    response: dict[str, Any] = {
+        "budget": budget,
+        "started_at": started_at,
+        "consumed": sorted(consumed),
+        "consumed_count": len(consumed),
+        "errors": [],
+        "scope": locality,
+    }
+    if initialized:
+        response["state_initialized"] = True
+        response["note"] = (
+            "Состояние бюджета отсутствовало и создано сейчас: если конфигурация правилась мимо CLI, "
+            "задачи до этого момента в счёт не попали."
+        )
+    if budget["mode"] == "count":
+        remaining = max(0, int(budget["value"]) - len(consumed))
+        response["remaining"] = remaining
+        response["allowed"] = remaining > 0
+        response["status"] = "PASS" if remaining > 0 else "BLOCKED"
+        if not response["allowed"]:
+            response["reason"] = (
+                f"Бюджет цепочки исчерпан: выполнено {len(consumed)} задач из {budget['value']} "
+                f"по решению {budget['decision_ref']}. Остановите конвейер, приложите отчёт-разбор и "
+                f"запросите новый бюджет новым decision_ref. {locality}"
+            )
+        return response
+    control = normalize_issue_key(budget["value"])
+    reached = control in consumed
+    response["control_issue"] = budget["value"]
+    response["control_issue_key"] = control
+    response["allowed"] = not reached
+    response["remaining"] = 0 if reached else 1
+    response["status"] = "BLOCKED" if reached else "PASS"
+    if reached:
+        response["reason"] = (
+            f"Бюджет цепочки исчерпан: контрольная задача {budget['value']} выполнена "
+            f"по решению {budget['decision_ref']}. Остановите конвейер, приложите отчёт-разбор и "
+            f"запросите новый бюджет новым decision_ref. {locality}"
+        )
+    return response
+
+
 def parse_check_results(items: list[str] | None) -> dict[str, str]:
     """Parse `--check name=conclusion` pairs.  A job status alone proves nothing."""
     results: dict[str, str] = {}
@@ -3983,6 +4158,12 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
     # the budget can be spent through unattributed records.
     budget = declared_cycle_for_node(workflow, node)
     issue_key = normalize_issue_key(issue)
+    pipeline = pipeline_budget_of(config)
+    if pipeline["mode"] != "manual" and not issue_key:
+        raise DevflowError(
+            "Активен бюджет конвейера — неатрибутированная запись расходовала бы его невидимо: "
+            "передайте --issue <ref>"
+        )
     if budget is not None and not issue_key:
         raise DevflowError(
             f"Узел {node} входит в объявленный цикл {budget.get('id')}: запись требует --issue, "
@@ -4449,6 +4630,10 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("area", choices=["git", "code", "quality", "ci", "docs", "security", "skills", "all"])
     audit.add_argument("--deep", action="store_true")
 
+    pipeline = sub.add_parser("pipeline", help="Autonomous task-chain budget")
+    pipeline_sub = pipeline.add_subparsers(dest="pipeline_command", required=True)
+    pipeline_sub.add_parser("check", help="Report the chain budget and whether the next task is allowed")
+
     install = sub.add_parser("install", help="Install or update this skill for Codex and Claude")
     install.add_argument("--client", choices=["codex", "claude", "both"], default="both")
     install.add_argument("--apply", action="store_true")
@@ -4742,6 +4927,10 @@ def execute(args: argparse.Namespace) -> int:
         result = audit_project(repo, args.area, args.deep)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
+    if args.command == "pipeline" and args.pipeline_command == "check":
+        result = pipeline_check(repo)
+        print_json(result)
+        return 0 if result.get("allowed") else 1
     if args.command == "install":
         clients = ["codex", "claude"] if args.client == "both" else [args.client]
         reports = [install_skill(client, args.apply, args.home, args.force) for client in clients]
