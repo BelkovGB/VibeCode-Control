@@ -158,6 +158,7 @@ devflow pipeline check
 devflow scale show
 devflow scale set <profile> --decision-ref <ref>
 devflow spec check <relative-path>
+devflow agents normalize [--apply] [--full-diff]
 devflow session check
 devflow session assign --node <id> --issue <ref> [--change-type <type>] [--pm-go <ref>]
 devflow operate --node <id> [--issue <ref>]
@@ -253,6 +254,7 @@ Use `python3 .agent-flow/devflow.py ...` on Linux and macOS. Do not tell the use
 | Untyped model or effort | Configuration predates the typed execution contract | Run `config normalize`, review the diff, then `--apply` |
 | Effective-configuration drift | Files on disk do not match the approved matrix | Apply was rolled back and `verify` is BLOCKED; fix the configuration and build a new plan |
 | Stale or missing managed block | Instructions no longer match the configured roles | Run `devflow upgrade --apply`, then re-check `doctor` |
+| Generated router section edited by hand | `AGENTS.md` disagrees with the configuration or the inspection it was built from | Fix the source fact, then `devflow agents normalize --apply` — not the section text |
 | Stage definitions older than the CLI | `.agent-flow/setup-stages.json` predates a stage this skill added; `setup` and `doctor` keep working and mark the stage `PARTIAL` | Run `devflow upgrade`, review the diff, then `--apply` |
 | Contracted review artifact missing | A green run is not a passed review | Record the artifact as `<name>=<kind>:<reference>` or keep the node below PASS |
 | Review node declares no required artifact | Graph predates the review-artifact contract; validation warns and `run record` refuses PASS | Run `devflow graph --migrate`, review the diff, then `--apply` |

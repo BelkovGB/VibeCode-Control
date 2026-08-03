@@ -2558,6 +2558,180 @@ class DevflowTestCase(unittest.TestCase):
         devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "test-upgrade"))
         self.assertTrue((self.repo / devflow.SESSION_ASSIGNMENT_TEMPLATE).is_file())
 
+    # --- agents normalize --------------------------------------------------------------
+
+    LEGACY_AGENTS = "\n".join([
+        "Preamble prose that lives before any heading.",
+        "",
+        "## Build and checks",
+        "",
+        "Run make build and then make test. Ask the maintainer if it breaks.",
+        "",
+        "## Our own deep section",
+        "",
+        "A long explanation nobody wants to pay for in every session.",
+        "",
+        "## Our own deep section",
+        "",
+        "A second section that happens to carry the same heading.",
+        "",
+    ])
+
+    def legacy_agents_project(self, claude=None):
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+        (self.repo / "AGENTS.md").write_text(self.LEGACY_AGENTS, encoding="utf-8")
+        if claude:
+            (self.repo / "CLAUDE.md").write_text(claude, encoding="utf-8")
+        (self.repo / "pkg").mkdir(exist_ok=True)
+        (self.repo / "pkg" / "AGENTS.md").write_text("rules for this package\n", encoding="utf-8")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "adopt", "legacy"))
+
+    def test_normalize_moves_every_section_and_maps_where_it_went(self):
+        self.legacy_agents_project()
+        plan = devflow.agents_normalize(self.repo, apply=False)
+        self.assertEqual(plan["status"], "PARTIAL")
+        self.assertTrue((self.repo / "AGENTS.md").read_text(encoding="utf-8").startswith("Preamble"))
+        destinations = {item["section"]: item["to"] for item in plan["map"]}
+        self.assertEqual(destinations["Preamble"], "docs/agents/preamble.md")
+        self.assertEqual(destinations["managed"], "регенерирован")
+        # A duplicate heading survives twice, with a deterministic suffix.
+        duplicates = [item["to"] for item in plan["map"] if item["section"] == "Our own deep section"]
+        self.assertEqual(duplicates, ["docs/agents/our-own-deep-section.md",
+                                      "docs/agents/our-own-deep-section-2.md"])
+        applied = devflow.agents_normalize(self.repo, apply=True)
+        self.assertEqual(applied["status"], "PASS")
+        for item in plan["map"]:
+            if item["to"] != "регенерирован" and item["to"] != "AGENTS.md":
+                self.assertTrue((self.repo / item["to"]).is_file(), item["to"])
+        second = (self.repo / "docs" / "agents" / "our-own-deep-section-2.md").read_text(encoding="utf-8")
+        self.assertIn("A second section", second)
+
+    def test_prose_in_a_generated_slot_moves_out_instead_of_being_melted_in(self):
+        self.legacy_agents_project()
+        devflow.agents_normalize(self.repo, apply=True)
+        moved = (self.repo / "docs" / "agents" / "build-and-checks.md").read_text(encoding="utf-8")
+        self.assertIn("Ask the maintainer", moved)
+        router = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        body = devflow.generated_section_body(router, "build-and-checks")
+        self.assertNotIn("Ask the maintainer", body)
+        self.assertIn("No verified command is configured", body)
+
+    def test_normalize_refuses_when_content_cannot_be_accounted_for(self):
+        self.legacy_agents_project()
+        original = devflow.plan_agents_normalization
+        try:
+            devflow.plan_agents_normalization = lambda repo, config: {
+                **original(repo, config), "moved": [], "kept": [],
+            }
+            report = devflow.agents_normalize(self.repo, apply=True)
+        finally:
+            devflow.plan_agents_normalization = original
+        self.assertEqual(report["status"], "BLOCKED")
+        self.assertIn("Our own deep section", report["unaccounted"])
+        self.assertTrue((self.repo / "AGENTS.md").read_text(encoding="utf-8").startswith("Preamble"))
+
+    def test_generated_sections_use_measured_facts_and_never_invent_commands(self):
+        self.legacy_agents_project()
+        devflow.agents_normalize(self.repo, apply=True)
+        router = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("Measure the baseline", devflow.generated_section_body(router, "build-and-checks"))
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["quality"]["baseline_status"] = "measured"
+        config["quality"]["commands"]["unit"] = ["python3 -m unittest discover"]
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        devflow.agents_normalize(self.repo, apply=True)
+        router = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("python3 -m unittest discover",
+                      devflow.generated_section_body(router, "build-and-checks"))
+
+    def test_doctor_sees_a_hand_edit_inside_a_generated_section_only(self):
+        self.legacy_agents_project()
+        devflow.agents_normalize(self.repo, apply=True)
+        clean = devflow.generated_section_report(
+            self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertEqual(clean["status"], "PASS")
+        router = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        body = devflow.generated_section_body(router, "repository-structure")
+        (self.repo / "AGENTS.md").write_text(
+            router.replace(body, "- `everything/`"), encoding="utf-8")
+        drifted = devflow.generated_section_report(
+            self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertEqual(drifted["status"], "PARTIAL")
+        self.assertIn({"section": "repository-structure", "state": "drift"}, drifted["details"])
+        # Text the owner wrote around the markers is theirs and is never judged.
+        router = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        (self.repo / "AGENTS.md").write_text(
+            router.replace("## Code conventions", "## Code conventions\n\nOur own words."),
+            encoding="utf-8")
+        self.assertEqual(devflow.generated_section_report(
+            self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))["details"],
+            drifted["details"])
+
+    def test_the_two_marker_kinds_do_not_read_each_other(self):
+        self.legacy_agents_project()
+        devflow.agents_normalize(self.repo, apply=True)
+        router = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertEqual(router.count(devflow.MANAGED_START), 1)
+        self.assertIn(devflow.GENERATED_START.format(name="build-and-checks"), router)
+        # The managed extractor must not swallow a generated region and vice versa.
+        without_managed = devflow.strip_managed_block(router)
+        self.assertIn(devflow.GENERATED_START.format(name="repository-structure"), without_managed)
+        without_generated = devflow.strip_generated_regions(router)
+        self.assertIn(devflow.MANAGED_START, without_generated)
+        self.assertIsNone(devflow.generated_section_body(without_generated, "build-and-checks"))
+        report = devflow.managed_block_report(self.repo)
+        self.assertEqual(report["status"], "PASS")
+
+    def test_claude_becomes_a_pointer_without_losing_its_own_content(self):
+        self.legacy_agents_project(claude="## Claude tooling\n\nUse the local MCP server.\n")
+        devflow.agents_normalize(self.repo, apply=True)
+        claude = (self.repo / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("[AGENTS.md](AGENTS.md)", claude)
+        self.assertEqual(claude.count(devflow.MANAGED_START), 1)
+        moved = next(path for path in (self.repo / "docs" / "agents").glob("claude-*.md"))
+        self.assertIn("Use the local MCP server", moved.read_text(encoding="utf-8"))
+        self.assertIn(moved.relative_to(self.repo).as_posix(), claude)
+
+    def test_normalize_is_idempotent_and_leaves_nested_files_alone(self):
+        self.legacy_agents_project(claude="## Claude tooling\n\nUse the local MCP server.\n")
+        statuses = [devflow.agents_normalize(self.repo, apply=True)["status"] for _ in range(3)]
+        self.assertEqual(statuses, ["PASS", "NOT_APPLICABLE", "NOT_APPLICABLE"])
+        report = devflow.agents_normalize(self.repo, apply=False)
+        self.assertEqual(report["nested_agents_files"], ["pkg/AGENTS.md"])
+        self.assertEqual((self.repo / "pkg" / "AGENTS.md").read_text(encoding="utf-8"),
+                         "rules for this package\n")
+
+    def test_normalize_writes_nothing_without_apply_and_rolls_back(self):
+        self.legacy_agents_project()
+        before = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        devflow.agents_normalize(self.repo, apply=False)
+        self.assertEqual((self.repo / "AGENTS.md").read_text(encoding="utf-8"), before)
+        applied = devflow.agents_normalize(self.repo, apply=True)
+        self.assertEqual(
+            devflow.verify_run(self.repo, applied["run_id"], applied["manifest_sha256"])["status"],
+            "PASS")
+        devflow.rollback_run(self.repo, applied["run_id"], applied["manifest_sha256"])
+        self.assertEqual((self.repo / "AGENTS.md").read_text(encoding="utf-8"), before)
+        self.assertFalse((self.repo / "docs" / "agents" / "preamble.md").exists())
+
+    def test_normalize_may_write_only_its_three_paths(self):
+        for relative in ("AGENTS.md", "CLAUDE.md", "docs/agents/x.md"):
+            self.assertTrue(devflow.plan_path_allowed("agents-normalize", relative), relative)
+        for relative in (devflow.CONFIG_PATH, devflow.WORKFLOW_PATH, "docs/ARCHITECTURE.md",
+                         "src/app.py", ".github/workflows/ci.yml"):
+            self.assertFalse(devflow.plan_path_allowed("agents-normalize", relative), relative)
+
+    def test_secret_values_never_reach_the_normalize_plan(self):
+        self.legacy_agents_project()
+        (self.repo / "AGENTS.md").write_text(
+            self.LEGACY_AGENTS + "\n## Secrets\n\nexport GITHUB_TOKEN=ghp_0123456789abcdef0123456789abcdef0123\n",
+            encoding="utf-8")
+        report = devflow.agents_normalize(self.repo, apply=False)
+        blob = json.dumps(report, ensure_ascii=False)
+        self.assertNotIn("ghp_0123456789abcdef", blob)
+        self.assertIn("redacted", blob)
+
     # --- test spec and model routing ---------------------------------------------------
 
     SPEC = "\n".join([
