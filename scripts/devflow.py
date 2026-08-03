@@ -67,6 +67,28 @@ TYPED_PROFILE_FIELDS = ("model", "effort")
 PROFILE_FIELDS = ("agent", "model", "effort", "permissions")
 # Agents that never execute a model, so an executable model/effort is a lie for them.
 NON_EXECUTING_AGENTS = {"human", "script", "deterministic"}
+# Client adapters live in the engine, not in the project configuration: `install` runs
+# without a project at all, and a copy of engine facts inside a guarded config would go
+# stale without `upgrade` ever replacing it.  A project extends the registry through an
+# optional `clients` block; the shipped kit carries none.
+CLIENT_ADAPTERS: dict[str, dict[str, Any]] = {
+    "codex": {
+        "agents": ["codex"],
+        "project_skill_root": ".agents/skills",
+        "personal_skill_root": ".agents/skills",
+        "managed_instructions": "AGENTS.md",
+        "effort": ["low", "medium", "high", "xhigh"],
+        "models": [],
+    },
+    "claude": {
+        "agents": ["claude-code"],
+        "project_skill_root": ".claude/skills",
+        "personal_skill_root": ".claude/skills",
+        "managed_instructions": "CLAUDE.md",
+        "effort": ["low", "medium", "high", "xhigh", "max"],
+        "models": [],
+    },
+}
 # Legacy scalar spellings accepted on read so existing projects normalize without
 # losing semantics.  They are never written back.
 LEGACY_MODE_TOKENS = {
@@ -1216,6 +1238,57 @@ def inspect_repository(repo: Path, deep: bool = False) -> dict[str, Any]:
     return report
 
 
+def client_registry(config: Any = None) -> dict[str, dict[str, Any]]:
+    """The engine adapters, extended by an optional project `clients` block."""
+    registry = copy.deepcopy(CLIENT_ADAPTERS)
+    extension = config.get("clients") if isinstance(config, dict) else None
+    if isinstance(extension, dict):
+        for name, adapter in extension.items():
+            if not isinstance(name, str) or not isinstance(adapter, dict):
+                continue
+            merged = dict(registry.get(name, {}))
+            merged.update(adapter)
+            registry[name] = merged
+    return registry
+
+
+def client_for_agent(agent: Any, registry: dict[str, dict[str, Any]] | None = None) -> str | None:
+    """Exact membership only.  Guessing a client from a substring accepted typos."""
+    if not isinstance(agent, str) or not agent.strip():
+        return None
+    registry = registry if registry is not None else CLIENT_ADAPTERS
+    for name in sorted(registry):
+        agents = registry[name].get("agents")
+        if isinstance(agents, list) and agent.strip() in agents:
+            return name
+    return None
+
+
+def known_agent_identifiers(registry: dict[str, dict[str, Any]] | None = None) -> set[str]:
+    registry = registry if registry is not None else CLIENT_ADAPTERS
+    known = set(NON_EXECUTING_AGENTS) | {AGENT_UNRESOLVED}
+    for adapter in registry.values():
+        agents = adapter.get("agents")
+        if isinstance(agents, list):
+            known.update(str(item) for item in agents)
+    return known
+
+
+def client_effort_vocabulary(client: str | None, registry: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    if not client:
+        return []
+    registry = registry if registry is not None else CLIENT_ADAPTERS
+    vocabulary = registry.get(client, {}).get("effort")
+    return [str(item) for item in vocabulary] if isinstance(vocabulary, list) else []
+
+
+def client_registry_hint(client: str | None) -> str:
+    return (
+        f"расширьте реестр блоком clients.{client or '<client>'} в .agent-flow/config.json, "
+        "если клиент выражает этот параметр"
+    )
+
+
 def parse_profile_value(raw: Any, pointer: str) -> tuple[dict[str, Any], list[str]]:
     """Parse one model/effort parameter into a typed {mode, value} pair.
 
@@ -1449,6 +1522,32 @@ def resolve_execution_profile(node: dict[str, Any], config: dict[str, Any]) -> d
     return resolution
 
 
+def effort_vocabulary_errors(pointer: str, agent: str, entry: Any,
+                             registry: dict[str, dict[str, Any]] | None = None) -> list[str]:
+    """An effort a client cannot express must not be configured for it."""
+    if not isinstance(entry, dict) or not agent or agent in NON_EXECUTING_AGENTS or agent == AGENT_UNRESOLVED:
+        return []
+    client = client_for_agent(agent, registry)
+    if client is None:
+        return []
+    vocabulary = client_effort_vocabulary(client, registry)
+    mode = entry.get("mode")
+    if not vocabulary:
+        if mode in {MODE_EXPLICIT, MODE_INHERITED}:
+            return [
+                f"{pointer}.effort: клиент {client} не объявляет словарь effort, "
+                f"поэтому mode={mode} нечем подтвердить; используйте mode={MODE_UNSET} или "
+                + client_registry_hint(client)
+            ]
+        return []
+    if mode == MODE_EXPLICIT and entry.get("value") not in vocabulary:
+        return [
+            f"{pointer}.effort: значение {entry.get('value')} отсутствует в словаре клиента {client} "
+            f"({', '.join(vocabulary)}); " + client_registry_hint(client)
+        ]
+    return []
+
+
 def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -1474,6 +1573,8 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
             "укажите policy.max_fix_cycles_decision_ref — непустую ссылку на решение PM "
             f"(Issue, PR или документ), чтобы разрешить до {MAX_FIX_CYCLES_ABSOLUTE}"
         )
+    registry = client_registry(config)
+    known_agents = known_agent_identifiers(registry)
     roles = config.get("roles")
     if not isinstance(roles, dict) or not roles:
         errors.append("config.roles отсутствует или пуст")
@@ -1500,6 +1601,13 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
             parsed[field] = entry
         typed_roles[role] = parsed
         agent = settings.get("agent").strip() if isinstance(settings.get("agent"), str) else ""
+        if agent and agent not in known_agents:
+            errors.append(
+                f"roles.{role}.agent: неизвестный agent {agent}; известны: "
+                + ", ".join(sorted(known_agents))
+                + "; новый клиент объявляется блоком clients в .agent-flow/config.json"
+            )
+        errors.extend(effort_vocabulary_errors(f"roles.{role}", agent, parsed.get("effort"), registry))
         if agent == AGENT_UNRESOLVED:
             # No executor has been chosen, so neither may its model or effort be:
             # anything else would be a value decided on behalf of the owner.
@@ -1565,10 +1673,23 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
             for field in ["agent", "permissions"]:
                 if field in settings and (not isinstance(settings[field], str) or not settings[field].strip()):
                     errors.append(f"node_overrides.{node_id}.{field} должен быть непустой строкой")
+            override_agent = settings.get("agent")
+            override_agent = override_agent.strip() if isinstance(override_agent, str) else ""
+            if override_agent and override_agent not in known_agents:
+                errors.append(
+                    f"node_overrides.{node_id}.agent: неизвестный agent {override_agent}; известны: "
+                    + ", ".join(sorted(known_agents))
+                )
+            parsed_override: dict[str, Any] = {}
             for field in TYPED_PROFILE_FIELDS:
                 if field in settings:
-                    _, field_errors = parse_profile_value(settings[field], f"node_overrides.{node_id}.{field}")
+                    entry, field_errors = parse_profile_value(settings[field], f"node_overrides.{node_id}.{field}")
                     errors.extend(field_errors)
+                    parsed_override[field] = entry
+            if override_agent and "effort" in parsed_override:
+                errors.extend(effort_vocabulary_errors(
+                    f"node_overrides.{node_id}", override_agent, parsed_override["effort"], registry
+                ))
     _, pipeline_errors = parse_pipeline_budget(
         config.get("automation", {}).get("pipeline") if isinstance(config.get("automation"), dict) else None
     )
@@ -1920,7 +2041,7 @@ def validate_skills_lock(lock: Any) -> list[str]:
             if not isinstance(skill.get("license"), str) or not skill.get("license"):
                 errors.append(f"skills.lock.skills[{index}].license должен быть непустой строкой")
             targets = skill.get("targets")
-            if not isinstance(targets, list) or not targets or any(target not in {"claude", "codex"} for target in targets):
+            if not isinstance(targets, list) or not targets or any(target not in CLIENT_ADAPTERS for target in targets):
                 errors.append(f"skills.lock.skills[{index}].targets некорректен")
             if not isinstance(skill.get("provenance"), dict):
                 errors.append(f"skills.lock.skills[{index}].provenance должен быть объектом")
@@ -2011,9 +2132,15 @@ def render_graph(workflow: dict[str, Any], config: dict[str, Any], lock: dict[st
     return "\n".join(lines)
 
 
+# Provenance is compared too: a value moving between role and node_override without
+# changing its value or mode is a real configuration change, and "cell by cell" has to
+# mean it literally.  The deliberate consequence is that `verify` reports such a move as
+# drift after an apply.
 EFFECTIVE_MATRIX_CELLS = (
     "stage", "state", "owner", "agent", "agent_mode",
-    "model", "model_mode", "effort", "effort_mode", "permissions",
+    "model", "model_mode", "model_source", "model_source_level",
+    "effort", "effort_mode", "effort_source", "effort_source_level",
+    "permissions", "permissions_source", "permissions_source_level",
 )
 
 
@@ -2279,11 +2406,12 @@ def audit_skill_directory(path: Path) -> dict[str, Any]:
 def target_skill_path(repo: Path, name: str, target: str) -> Path:
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name):
         raise DevflowError(f"Некорректное имя скилла: {name}")
-    if target == "codex":
-        return ensure_within(repo, f".agents/skills/{name}")
-    if target == "claude":
-        return ensure_within(repo, f".claude/skills/{name}")
-    raise DevflowError(f"Неизвестная цель скилла: {target}")
+    root = CLIENT_ADAPTERS.get(target, {}).get("project_skill_root")
+    if not root:
+        raise DevflowError(
+            f"Неизвестная цель скилла: {target}; известны " + ", ".join(sorted(CLIENT_ADAPTERS))
+        )
+    return ensure_within(repo, f"{root}/{name}")
 
 
 def vendor_skill_path(repo: Path, skill: dict[str, Any]) -> Path:
@@ -2303,22 +2431,14 @@ def find_locked_skill(lock: dict[str, Any], name: str) -> dict[str, Any]:
     raise DevflowError(f"Скилл {name} не зарегистрирован в lock-файле")
 
 
-def expected_target_for_agent(agent: str) -> str | None:
-    lowered = agent.lower()
-    if "claude" in lowered:
-        return "claude"
-    if "codex" in lowered or "openai" in lowered:
-        return "codex"
-    return None
+def expected_target_for_agent(agent: str, registry: dict[str, dict[str, Any]] | None = None) -> str | None:
+    return client_for_agent(agent, registry)
 
 
 SKILL_PUBLIC_NAME = "vibecode-control"
 # Where each client loads a personal skill from.  The project-scoped roots live in
 # `target_skill_path`; these are the user-level ones.
-PERSONAL_SKILL_ROOTS = {
-    "codex": (".agents", "skills"),
-    "claude": (".claude", "skills"),
-}
+
 
 
 def skill_source_root() -> Path:
@@ -2331,12 +2451,13 @@ def skill_source_root() -> Path:
 
 
 def personal_skill_target(client: str, home: Path | None = None) -> Path:
-    if client not in PERSONAL_SKILL_ROOTS:
+    root = CLIENT_ADAPTERS.get(client, {}).get("personal_skill_root")
+    if not root:
         raise DevflowError(
-            f"Неизвестный клиент: {client}; поддерживаются " + ", ".join(sorted(PERSONAL_SKILL_ROOTS))
+            f"Неизвестный клиент: {client}; поддерживаются " + ", ".join(sorted(CLIENT_ADAPTERS))
         )
     base = home.resolve() if home is not None else Path.home()
-    return base.joinpath(*PERSONAL_SKILL_ROOTS[client], SKILL_PUBLIC_NAME)
+    return base.joinpath(*str(root).split("/"), SKILL_PUBLIC_NAME)
 
 
 def install_skill(client: str, apply: bool = False, home: Path | None = None,
@@ -2469,7 +2590,7 @@ def skills_audit(repo: Path, node: str | None = None, deep: bool = False) -> dic
         ):
             errors.append(f"Provenance скилла {name} не совпадает с source URL")
         targets = skill.get("targets")
-        if not isinstance(targets, list) or not targets or any(target not in {"claude", "codex"} for target in targets):
+        if not isinstance(targets, list) or not targets or any(target not in CLIENT_ADAPTERS for target in targets):
             errors.append(f"Скилл {name} не имеет корректных target-платформ")
         if not skill.get("license"):
             warnings.append(f"Для скилла {name} не зафиксирована лицензия")
@@ -3007,16 +3128,81 @@ def configure_value(repo: Path, dotted: str, raw: str) -> dict[str, Any]:
     return result
 
 
+def transfer_execution_parameters(settings: dict[str, Any], previous_agent: str, agent: str,
+                                  registry: dict[str, dict[str, Any]], pointer: str) -> list[str]:
+    """Apply the cross-client transition to one role or override, loudly.
+
+    A client change must not carry the previous client's chosen model or effort: the
+    values are not interchangeable, so they go back to `undecided` and must be chosen
+    again.  Two agents of the same client transfer without a reset.
+    """
+    reset: list[str] = []
+    previous_client = client_for_agent(previous_agent, registry)
+    client = client_for_agent(agent, registry)
+    was_executing = bool(previous_agent) and previous_agent not in NON_EXECUTING_AGENTS and previous_agent != AGENT_UNRESOLVED
+    executes = bool(agent) and agent not in NON_EXECUTING_AGENTS and agent != AGENT_UNRESOLVED
+    for field in TYPED_PROFILE_FIELDS:
+        if field not in settings:
+            continue
+        entry, _ = parse_profile_value(settings[field], f"{pointer}.{field}")
+        mode = entry.get("mode")
+        if executes and not was_executing:
+            if mode == MODE_NOT_APPLICABLE:
+                settings[field] = {"mode": MODE_UNDECIDED}
+                reset.append(f"{pointer}.{field}: {MODE_NOT_APPLICABLE} → {MODE_UNDECIDED}")
+        elif not executes and was_executing:
+            if mode != MODE_NOT_APPLICABLE:
+                settings[field] = {"mode": MODE_NOT_APPLICABLE}
+                reset.append(f"{pointer}.{field}: {mode} → {MODE_NOT_APPLICABLE}")
+        elif executes and was_executing and previous_client != client:
+            # `inherited` stays: the new client resolves it itself.  `unset` and
+            # `undecided` carry no value, so there is nothing to carry over.
+            if mode == MODE_EXPLICIT:
+                settings[field] = {"mode": MODE_UNDECIDED}
+                reset.append(f"{pointer}.{field}: {MODE_EXPLICIT} → {MODE_UNDECIDED}")
+    return reset
+
+
 def configure_role(repo: Path, role: str, agent: str) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
     if role not in config.get("roles", {}):
         raise DevflowError(f"Неизвестная роль: {role}")
-    config["roles"][role]["agent"] = agent
+    registry = client_registry(config)
+    settings = config["roles"][role]
+    previous_agent = settings.get("agent") if isinstance(settings.get("agent"), str) else ""
+    settings["agent"] = agent
+    reset = transfer_execution_parameters(settings, previous_agent, agent, registry, f"roles.{role}")
+    # The cascade: an override that names no agent of its own resolves against the new
+    # client, so its chosen values would otherwise slip past the reset one level down.
+    overrides = config.get("node_overrides")
+    if isinstance(overrides, dict):
+        node_roles = {
+            node.get("id"): node.get("role")
+            for node in workflow.get("nodes", []) if isinstance(node, dict)
+        }
+        for node_id in sorted(overrides):
+            override = overrides[node_id]
+            if not isinstance(override, dict) or node_roles.get(node_id) != role:
+                continue
+            if isinstance(override.get("agent"), str) and override["agent"].strip():
+                continue
+            reset.extend(transfer_execution_parameters(
+                override, previous_agent, agent, registry, f"node_overrides.{node_id}"
+            ))
     errors, _ = validate_config(config)
     if errors:
         raise DevflowError("Конфигурация после изменения невалидна: " + "; ".join(errors))
     mark_skill_revalidation(config, workflow, lock, role)
-    return apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "role-set")
+    result = apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "role-set")
+    result["previous_agent"] = previous_agent
+    result["client"] = client_for_agent(agent, registry)
+    result["reset_parameters"] = reset
+    if reset:
+        result["note"] = (
+            "Смена клиента: перечисленные параметры сброшены в "
+            f"{MODE_UNDECIDED} и должны быть выбраны заново — значения клиентов не взаимозаменяемы"
+        )
+    return result
 
 
 def configure_model(repo: Path, target: str, model: str, effort: str | None) -> dict[str, Any]:
@@ -3240,8 +3426,8 @@ def register_skill(repo: Path, name: str, source_path: Path, source_url: str, co
             "audit": static,
             "next_command": "Review every finding. Do not approve merely to bypass the audit."
         }
-    if any(target not in {"claude", "codex"} for target in targets) or not targets:
-        raise DevflowError("targets должны содержать claude и/или codex")
+    if any(target not in CLIENT_ADAPTERS for target in targets) or not targets:
+        raise DevflowError("targets должны называть известных клиентов: " + ", ".join(sorted(CLIENT_ADAPTERS)))
     checksum = static["checksum"]
     vendor_rel = f"{META_DIR}/vendor-skills/{name}"
     previous = next((item for item in lock.get("skills", []) if item.get("name") == name), None)
@@ -4175,6 +4361,12 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
     if not evidence or not all(isinstance(item, str) and item.strip() for item in evidence):
         raise DevflowError("Run record требует хотя бы одно непустое доказательство")
     check_results = parse_check_results(checks)
+    registry = client_registry(config)
+    observed_client = client_for_agent(actual_agent, registry) or client_for_agent(
+        effective.get("resolution", {}).get("agent", {}).get("value"), registry
+    )
+    effort_vocabulary = client_effort_vocabulary(observed_client, registry)
+    effort_not_expressible = False
     # A record of a node inside a declared cycle has to be attributable to an Issue, or
     # the budget can be spent through unattributed records.
     budget = declared_cycle_for_node(workflow, node)
@@ -4299,6 +4491,12 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
             )
         resolution = effective.get("resolution", {})
         observed = {"agent": actual_agent, "model": actual_model, "effort": actual_effort}
+        if actual_effort and effort_vocabulary and actual_effort not in effort_vocabulary:
+            # An observed effort the client cannot express is a lie in any mode.
+            raise DevflowError(
+                f"Фактический effort {actual_effort} отсутствует в словаре клиента {observed_client} "
+                f"({', '.join(effort_vocabulary)}); " + client_registry_hint(observed_client)
+            )
         for field in ("agent", "model", "effort"):
             entry = resolution.get(field, {"mode": MODE_UNSET})
             mode = entry.get("mode")
@@ -4325,6 +4523,11 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
                     "нельзя записать PASS для узла, исполнение которого никто не решал"
                 )
             elif not actual_value:
+                if field == "effort" and not effort_vocabulary:
+                    # The client cannot express effort at all, so demanding an observed
+                    # value would force an invention.  The record says so instead.
+                    effort_not_expressible = True
+                    continue
                 raise DevflowError(
                     f"Параметр {field} намеренно не задан (mode={MODE_UNSET}): "
                     "PASS требует записать фактически использованное значение, но оно не подставляется в конфигурацию"
@@ -4360,6 +4563,8 @@ def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr
             },
         },
         "actual": {"agent": actual_agent, "model": actual_model, "effort": actual_effort},
+        "client": observed_client,
+        "effort_note": "client-has-no-effort-vocabulary" if effort_not_expressible else None,
         "evidence": evidence,
         "evidence_by_name": evidence_by_name,
         "checks": check_results,
@@ -4504,7 +4709,7 @@ def add_register_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source", required=True, help="Allowlisted canonical source URL")
     parser.add_argument("--commit", required=True, help="Full 40-character Git commit SHA")
     parser.add_argument("--license", required=True, dest="license_name")
-    parser.add_argument("--targets", default="claude,codex", help="Comma-separated claude,codex")
+    parser.add_argument("--targets", default=",".join(sorted(CLIENT_ADAPTERS)), help="Comma-separated client names")
     parser.add_argument("--approved-by-user", action="store_true")
     parser.add_argument("--apply", action="store_true")
 

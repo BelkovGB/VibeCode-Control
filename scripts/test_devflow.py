@@ -46,7 +46,7 @@ class DevflowTestCase(unittest.TestCase):
         ], check=True)
         head = subprocess.run(
             ["git", "-C", str(source_root), "rev-parse", "HEAD"],
-            check=True, text=True, capture_output=True,
+            check=True, text=True, encoding="utf-8", capture_output=True,
         ).stdout.strip()
         source_url = repository.removesuffix(".git") + f"/tree/{head}/skills/{name}"
         return source_root, skill, head, source_url
@@ -149,14 +149,14 @@ class DevflowTestCase(unittest.TestCase):
         wrong = subprocess.run(
             ["python3", str(MODULE_PATH), "--repo", str(self.repo), "apply", "--plan", relative,
              "--expected-sha256", "0" * 64],
-            text=True, capture_output=True, check=False,
+            text=True, encoding="utf-8", capture_output=True, check=False,
         )
         self.assertEqual(wrong.returncode, 2)
         self.assertFalse((self.repo / "AGENTS.md").exists())
         correct = subprocess.run(
             ["python3", str(MODULE_PATH), "--repo", str(self.repo), "apply", "--plan", relative,
              "--expected-sha256", devflow.sha256_file(path)],
-            text=True, capture_output=True, check=False,
+            text=True, encoding="utf-8", capture_output=True, check=False,
         )
         self.assertEqual(correct.returncode, 0, correct.stdout + correct.stderr)
 
@@ -399,7 +399,7 @@ class DevflowTestCase(unittest.TestCase):
         ], check=True)
         head = subprocess.run(
             ["git", "-C", str(source_root), "rev-parse", "HEAD"],
-            check=True, text=True, capture_output=True,
+            check=True, text=True, encoding="utf-8", capture_output=True,
         ).stdout.strip()
         source_url = "https://github.com/openai/skills/tree/" + head + "/skills/versioned-skill"
         devflow.register_skill(
@@ -605,6 +605,7 @@ class DevflowTestCase(unittest.TestCase):
             ["python3", str(cli), "--repo", str(self.repo), "graph", "--format", "table"],
             text=True,
             capture_output=True,
+            encoding="utf-8",
             check=False,
         )
         self.assertEqual(graph.returncode, 0, graph.stderr)
@@ -613,6 +614,7 @@ class DevflowTestCase(unittest.TestCase):
             ["python3", str(cli), "--repo", str(self.repo), "setup", "next"],
             text=True,
             capture_output=True,
+            encoding="utf-8",
             check=False,
         )
         self.assertEqual(next_step.returncode, 1)
@@ -662,7 +664,7 @@ class DevflowTestCase(unittest.TestCase):
         ], check=True)
         head = subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
-            text=True, capture_output=True, check=True,
+            text=True, encoding="utf-8", capture_output=True, check=True,
         ).stdout.strip()
         with self.assertRaises(devflow.DevflowError):
             devflow.record_run(
@@ -743,6 +745,7 @@ class DevflowTestCase(unittest.TestCase):
             ["python3", str(cli), "--repo", str(self.repo), "scheme", "repair"],
             text=True,
             capture_output=True,
+            encoding="utf-8",
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -783,7 +786,7 @@ class DevflowTestCase(unittest.TestCase):
         ], check=True)
         return subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
-            text=True, capture_output=True, check=True,
+            text=True, encoding="utf-8", capture_output=True, check=True,
         ).stdout.strip()
 
     def choose_executors(self, agent="codex", model="verified-model", effort="high",
@@ -1039,12 +1042,12 @@ class DevflowTestCase(unittest.TestCase):
         self.assertIn("`reviewer`", block)
         self.assertEqual(devflow.managed_block_report(self.repo)["status"], "PASS")
 
-    def test_role_set_refuses_to_write_a_configuration_it_would_invalidate(self):
+    def test_role_set_refuses_an_unknown_agent_and_leaves_the_config_alone(self):
         self.apply_init()
         self.choose_executors(agent="claude-code")
         with self.assertRaises(devflow.DevflowError) as context:
-            devflow.configure_role(self.repo, "implementer", "human")
-        self.assertIn("невалидна", str(context.exception))
+            devflow.configure_role(self.repo, "implementer", "devflow_development")
+        self.assertIn("неизвестный agent", str(context.exception))
         config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
         self.assertEqual(config["roles"]["implementer"]["agent"], "claude-code")
 
@@ -1485,6 +1488,188 @@ class DevflowTestCase(unittest.TestCase):
         config["policy"]["max_fix_cycles"] = 11
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("от 1 до 10" in item for item in errors))
+
+    # --- client adapters -----------------------------------------------------------------
+
+    def test_unknown_agent_reference_blocks_validation_with_its_pointer(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        # The typo class from the first pilot: devflow_development vs devflow-development.
+        config["roles"]["qa"]["agent"] = "devflow_development"
+        config["roles"]["qa"]["model"] = {"mode": "inherited"}
+        config["roles"]["qa"]["effort"] = {"mode": "unset"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("roles.qa.agent" in item and "неизвестный agent" in item for item in errors))
+        config = devflow.load_json(kit / "config.json")
+        config["node_overrides"] = {"implement": {"agent": "claude_code"}}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("node_overrides.implement.agent" in item for item in errors))
+
+    def test_client_is_resolved_by_membership_not_by_substring(self):
+        self.assertEqual(devflow.client_for_agent("claude-code"), "claude")
+        self.assertEqual(devflow.client_for_agent("codex"), "codex")
+        # A name that merely contains a client name is not that client.
+        self.assertIsNone(devflow.client_for_agent("claude_code"))
+        self.assertIsNone(devflow.client_for_agent("my-codex-fork"))
+        self.assertIsNone(devflow.client_for_agent(devflow.AGENT_UNRESOLVED))
+
+    def test_registry_is_extensible_by_configuration_and_absent_from_the_kit(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertNotIn("clients", config)
+        config["clients"] = {"gemini": {"agents": ["gemini-cli"], "effort": ["standard"]}}
+        registry = devflow.client_registry(config)
+        self.assertEqual(devflow.client_for_agent("gemini-cli", registry), "gemini")
+        self.assertIn("gemini-cli", devflow.known_agent_identifiers(registry))
+        config["roles"]["qa"]["agent"] = "gemini-cli"
+        config["roles"]["qa"]["model"] = {"mode": "inherited"}
+        config["roles"]["qa"]["effort"] = {"mode": "explicit", "value": "standard"}
+        errors, _ = devflow.validate_config(config)
+        self.assertEqual(errors, [])
+
+    def test_effort_outside_the_client_vocabulary_is_rejected(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["roles"]["qa"]["agent"] = "codex"
+        config["roles"]["qa"]["model"] = {"mode": "inherited"}
+        config["roles"]["qa"]["effort"] = {"mode": "explicit", "value": "max"}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("словаре клиента codex" in item for item in errors))
+        config["roles"]["qa"]["agent"] = "claude-code"
+        errors, _ = devflow.validate_config(config)
+        self.assertEqual(errors, [])
+
+    def test_client_without_an_effort_vocabulary_rejects_an_expressed_effort(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["clients"] = {"silent": {"agents": ["silent-runner"], "effort": []}}
+        config["roles"]["qa"]["agent"] = "silent-runner"
+        config["roles"]["qa"]["model"] = {"mode": "inherited"}
+        for mode in [{"mode": "explicit", "value": "high"}, {"mode": "inherited"}]:
+            config["roles"]["qa"]["effort"] = mode
+            errors, _ = devflow.validate_config(config)
+            self.assertTrue(any("не объявляет словарь effort" in item for item in errors), mode)
+            self.assertTrue(any("clients.silent" in item for item in errors), mode)
+        config["roles"]["qa"]["effort"] = {"mode": "unset"}
+        errors, _ = devflow.validate_config(config)
+        self.assertEqual(errors, [])
+
+    def test_unset_effort_needs_no_observed_value_when_the_client_cannot_express_it(self):
+        self.apply_init()
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["clients"] = {"silent": {"agents": ["silent-runner"], "effort": []}}
+        for settings in config["roles"].values():
+            if settings["agent"] == "human":
+                continue
+            settings.update({
+                "agent": "silent-runner",
+                "model": {"mode": "explicit", "value": "verified-model"},
+                "effort": {"mode": "unset"},
+            })
+        config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["verified-model"]}
+        config["automation"]["background_workers"] = "verified"
+        config["github"].update({"remote_settings": "verified", "ruleset_verified": True, "required_checks": []})
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        self.resolve_all_skill_decisions()
+        head = self.commit_worktree()
+        recorded = devflow.record_run(
+            self.repo, "implement", "PASS", head, "#13", "PR-1",
+            ["passing targeted tests=ci://t", "implementation diff=git://d",
+             "updated architecture docs when required=n/a"],
+            "silent-runner", "verified-model", None, [],
+        )
+        self.assertEqual(recorded["status"], "PASS")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertIsNone(stored["actual"]["effort"])
+        self.assertEqual(stored["effort_note"], "client-has-no-effort-vocabulary")
+        self.assertEqual(stored["client"], "silent")
+
+    def test_observed_effort_outside_the_client_vocabulary_is_refused(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(required_checks=(), agent="codex")
+        head = self.commit_worktree()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "implement", "PASS", head, "#13", "PR-1",
+                ["passing targeted tests=ci://t", "implementation diff=git://d",
+                 "updated architecture docs when required=n/a"],
+                "codex", "verified-model", "max", [],
+            )
+        self.assertIn("словаре клиента codex", str(context.exception))
+
+    def test_moving_a_value_between_levels_is_matrix_drift(self):
+        self.apply_init()
+        self.choose_executors(agent="codex", model=None, effort="high")
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        # Same value and same mode, different level: previously invisible to the comparison.
+        config["node_overrides"] = {"implement": {"effort": {"mode": "explicit", "value": "high"}}}
+        (self.repo / devflow.CONFIG_PATH).write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        moved = devflow.effective_configuration_from_files(self.repo)
+        row = next(item for item in moved["rows"] if item["node"] == "implement")
+        self.assertEqual(row["effort"], "high")
+        self.assertEqual(row["effort_source_level"], "node-override")
+        as_role = copy.deepcopy(moved)
+        for item in as_role["rows"]:
+            if item["node"] == "implement":
+                item["effort_source_level"] = "role"
+                item["effort_source"] = "roles.implementer.effort"
+        differences = devflow.compare_effective_configuration(as_role, moved)
+        self.assertTrue(any("effort_source_level" in item for item in differences))
+
+    def test_cross_client_transfer_resets_chosen_values_loudly(self):
+        self.apply_init()
+        self.choose_executors(agent="codex", model=None, effort="high")
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["roles"]["implementer"]["model"] = {"mode": "explicit", "value": "gpt-5"}
+        config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["gpt-5"]}
+        config["node_overrides"] = {
+            "implement": {"effort": {"mode": "explicit", "value": "high"}},
+            "tdd_red": {"agent": "codex", "effort": {"mode": "explicit", "value": "high"}},
+        }
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        result = devflow.configure_role(self.repo, "implementer", "claude-code")
+        moved = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(moved["roles"]["implementer"]["model"], {"mode": "undecided"})
+        self.assertEqual(moved["roles"]["implementer"]["effort"], {"mode": "undecided"})
+        # The cascade: an override naming no agent of its own follows the role's client.
+        self.assertEqual(moved["node_overrides"]["implement"]["effort"], {"mode": "undecided"})
+        # An override that names its own agent keeps its client and its value.
+        self.assertEqual(
+            moved["node_overrides"]["tdd_red"]["effort"], {"mode": "explicit", "value": "high"})
+        self.assertTrue(any("roles.implementer.model" in item for item in result["reset_parameters"]))
+        self.assertTrue(any("node_overrides.implement.effort" in item for item in result["reset_parameters"]))
+        self.assertIn("не взаимозаменяемы", result["note"])
+
+    def test_same_client_agent_change_keeps_the_chosen_values(self):
+        self.apply_init()
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["clients"] = {"codex": {"agents": ["codex", "codex-cloud"]}}
+        for settings in config["roles"].values():
+            if settings["agent"] == "human":
+                continue
+            settings.update({
+                "agent": "codex",
+                "model": {"mode": "explicit", "value": "gpt-5"},
+                "effort": {"mode": "explicit", "value": "high"},
+            })
+        config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["gpt-5"]}
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        result = devflow.configure_role(self.repo, "implementer", "codex-cloud")
+        kept = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(kept["roles"]["implementer"]["model"], {"mode": "explicit", "value": "gpt-5"})
+        self.assertEqual(result["reset_parameters"], [])
+
+    def test_transfer_to_and_from_a_non_executing_agent(self):
+        self.apply_init()
+        self.choose_executors(agent="codex", model=None, effort="high")
+        devflow.configure_role(self.repo, "implementer", "human")
+        parked = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(parked["roles"]["implementer"]["model"], {"mode": "not-applicable"})
+        self.assertEqual(parked["roles"]["implementer"]["effort"], {"mode": "not-applicable"})
+        devflow.configure_role(self.repo, "implementer", "claude-code")
+        back = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertEqual(back["roles"]["implementer"]["model"], {"mode": "undecided"})
+        self.assertEqual(back["roles"]["implementer"]["effort"], {"mode": "undecided"})
 
     # --- autonomous chain budget ---------------------------------------------------------
 

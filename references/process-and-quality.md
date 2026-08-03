@@ -106,6 +106,8 @@ The run record compares the configured execution parameters (`agent`, `model`, `
 - `not-applicable` — the role executes no model; recording any model or effort for it is fabricated evidence and is rejected;
 - `undecided` — nobody has chosen the parameter yet; the node cannot preflight and cannot record a `PASS` until the owner decides.
 
+An observed effort must belong to the client's effort vocabulary; a value the client cannot express is a lie in any mode and is rejected. When the client declares no effort vocabulary at all, an `unset` effort needs no observed value: the record stores it as absent with `effort_note: client-has-no-effort-vocabulary`, which is a contract rather than a substituted value. The record also stores the resolved `client`.
+
 The record stores `checks` plus `configured.modes` and `configured.sources` per parameter, so a later reader sees which value was pinned, which was observed at run time, and where each came from.
 
 ## Review, merge, and documentation
