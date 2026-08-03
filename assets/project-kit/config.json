@@ -138,6 +138,9 @@
     "pipeline": {
       "mode": "manual"
     },
+    "sessions": {
+      "mode": "undecided"
+    },
     "notifications": "state-change-only",
     "run_records_path": ".agent-flow/.local/node-runs",
     "evidence_must_match_head_sha": true

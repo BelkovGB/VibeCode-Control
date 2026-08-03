@@ -2301,6 +2301,205 @@ class DevflowTestCase(unittest.TestCase):
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("агент не выбран" in item for item in errors))
 
+    # --- session transport -----------------------------------------------------------
+
+    def declare_sessions(self, implementer="impl-chat", reviewer="review-chat", client="claude",
+                         extra=None):
+        roles = {}
+        if implementer is not None:
+            roles["implementer"] = {"mode": "explicit", "session": implementer}
+        if reviewer is not None:
+            roles["reviewer"] = {"mode": "explicit", "session": reviewer}
+        roles.update(extra or {})
+        return devflow.configure_value(self.repo, "automation.sessions", json.dumps(
+            {"mode": "explicit", "client": client, "roles": roles}))
+
+    def commit_fixture(self):
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run([
+            "git", "-C", str(self.repo), "-c", "user.name=VibeCode Control Test",
+            "-c", "user.email=devflow@example.invalid", "commit", "-qm", "fixture",
+        ], check=True, capture_output=True)
+        head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                              check=True, text=True, encoding="utf-8", capture_output=True)
+        return head.stdout.strip()
+
+    def test_kit_names_no_session_and_setup_asks_for_the_transport(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertEqual(config["automation"]["sessions"], {"mode": "undecided"})
+        self.apply_init()
+        stage = next(item for item in devflow.evaluate_setup(self.repo)
+                     if item["stage"] == "automation")
+        self.assertTrue(stage["requires_user_decision"])
+        self.assertTrue(any("automation.sessions" in gap for gap in stage["gaps"]))
+        self.assertIn("session transport=undecided", stage["evidence"])
+
+    def test_session_transport_requires_a_client_that_declares_the_capability(self):
+        self.apply_init()
+        with self.assertRaises(devflow.DevflowError) as context:
+            self.declare_sessions(client="codex")
+        self.assertIn("session_messaging", str(context.exception))
+        # The capability is an adapter fact, so a project extension enables it without
+        # touching the engine rule.
+        devflow.configure_value(self.repo, "clients", json.dumps(
+            {"codex": {"session_messaging": True}}))
+        self.declare_sessions(client="codex")
+        self.assertEqual(devflow.session_transport_of(
+            devflow.load_json(self.repo / devflow.CONFIG_PATH))["client"], "codex")
+
+    def test_session_registry_shape_is_typed(self):
+        entry, errors = devflow.parse_session_role({"mode": "explicit"}, "p")
+        self.assertTrue(any("p.session обязателен" in item for item in errors))
+        del entry
+        _, forbidden = devflow.parse_session_role({"mode": "undecided", "session": "x"}, "p")
+        self.assertTrue(any("недопустим при mode=undecided" in item for item in forbidden))
+        self.apply_init()
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["automation"]["sessions"] = {
+            "mode": "explicit", "client": "claude",
+            "roles": {"nonexistent": {"mode": "explicit", "session": "s"}},
+        }
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("не объявлена в config.roles" in item for item in errors))
+
+    def test_one_session_cannot_both_implement_and_review_independently(self):
+        self.apply_init()
+        with self.assertRaises(devflow.DevflowError) as context:
+            self.declare_sessions(implementer="one-chat", reviewer="one-chat")
+        message = str(context.exception)
+        self.assertIn("изоляция контекстов нарушена", message)
+        self.assertIn("final_review", message)
+        # The write is refused where it happens, not only later by doctor.
+        self.assertEqual(
+            devflow.session_transport_of(devflow.load_json(self.repo / devflow.CONFIG_PATH))["mode"],
+            "undecided")
+
+    def test_self_review_by_the_implementer_session_stays_legal(self):
+        self.apply_init()
+        self.declare_sessions()
+        _, workflow, _ = devflow.load_project_state(self.repo)
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertEqual(errors, [])
+        report = devflow.session_report(self.repo, config, workflow)
+        self.assertEqual(report["bindings"]["implementer_review"], "impl-chat")
+        self.assertEqual(report["bindings"]["final_review"], "review-chat")
+
+    def test_assign_refuses_a_manual_budget_without_a_named_pm_go(self):
+        self.apply_init()
+        self.declare_sessions()
+        self.commit_fixture()
+        blocked = devflow.session_assign(self.repo, "implement", "#17")
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertIn("явному го PM", blocked["reason"])
+        rendered = devflow.session_assign(self.repo, "implement", "#17", pm_go="PM-77")
+        self.assertEqual(rendered["status"], "PASS")
+        self.assertEqual(rendered["authorization"], {"kind": "pm-go", "ref": "PM-77",
+                                                     "continuation": False})
+        self.assertIn("PM-77", rendered["assignment"])
+
+    def test_assign_renders_the_facts_the_coordinator_would_otherwise_retype(self):
+        self.apply_init()
+        self.declare_sessions()
+        head = self.commit_fixture()
+        rendered = devflow.session_assign(self.repo, "final_review", "#17", pm_go="PM-77")
+        text = rendered["assignment"]
+        self.assertEqual(rendered["session"], "review-chat")
+        self.assertEqual(rendered["head_sha"], head)
+        self.assertIn(head, text)
+        self.assertIn("operate --node final_review --issue '#17'", text)
+        self.assertIn("run record --node final_review", text)
+        # The evidence contract, not a retyped list.
+        self.assertIn("review verdict bound to head SHA", text)
+        self.assertIn("kind `review`", text)
+        # Two rules the transport exists to carry.
+        self.assertIn("restarted whole from the last recorded run record", text)
+        self.assertIn("does not send it", text)
+
+    def test_assign_refuses_a_new_issue_on_a_spent_budget_but_continues_a_counted_one(self):
+        self.apply_init()
+        self.declare_sessions()
+        self.commit_fixture()
+        self.set_pipeline_budget({"mode": "count", "value": 1, "decision_ref": "PM-9"})
+        self.consume_chain_task("#17")
+        spent = devflow.pipeline_check(self.repo)
+        self.assertFalse(spent["allowed"])
+        continuation = devflow.session_assign(self.repo, "implement", "#17")
+        self.assertEqual(continuation["status"], "PASS")
+        self.assertTrue(continuation["authorization"]["continuation"])
+        fresh = devflow.session_assign(self.repo, "implement", "#18")
+        self.assertEqual(fresh["status"], "BLOCKED")
+        self.assertIn("Бюджет цепочки исчерпан", fresh["reason"])
+
+    def test_assign_names_the_command_when_the_role_has_no_session(self):
+        self.apply_init()
+        self.commit_fixture()
+        with self.assertRaises(devflow.DevflowError) as undeclared:
+            devflow.session_assign(self.repo, "implement", "#17", pm_go="PM-77")
+        self.assertIn("Транспорт сессий не объявлен", str(undeclared.exception))
+        self.declare_sessions(implementer=None)
+        with self.assertRaises(devflow.DevflowError) as unnamed:
+            devflow.session_assign(self.repo, "implement", "#17", pm_go="PM-77")
+        self.assertIn("automation.sessions.roles.implementer", str(unnamed.exception))
+
+    def test_preflight_reports_the_session_and_refuses_to_claim_it_is_alive(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(agent="claude-code")
+        self.declare_sessions(extra={"qa": {"mode": "explicit", "session": "qa-chat"}})
+        report = devflow.operate_preflight(self.repo, "implement", "#17")
+        self.assertEqual(report["transport"]["session"], "impl-chat")
+        self.assertEqual(report["transport"]["kind"], "sessions")
+        self.assertIn("CLI сессий не видит", report["transport"]["liveness"])
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["external_gaps"], [])
+        # A role without a session is a named gap, not a silent pass.
+        devflow.configure_value(self.repo, "automation.sessions.roles.qa",
+                                json.dumps({"mode": "undecided"}))
+        qa = devflow.operate_preflight(self.repo, "quality_gates", "#17")
+        self.assertTrue(any("Сессия для роли qa не названа" in gap for gap in qa["external_gaps"]))
+
+    def test_a_named_session_does_not_replace_verified_background_workers(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code")
+        self.resolve_all_skill_decisions()
+        self.declare_sessions()
+        report = devflow.operate_preflight(self.repo, "implement", "#17")
+        self.assertEqual(report["transport"]["session"], "impl-chat")
+        self.assertIn("Background executor availability is unverified", report["external_gaps"])
+
+    def test_assignment_template_must_not_ask_for_facts_the_cli_does_not_supply(self):
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.render_session_assignment("{{node}} {{invented_fact}}", {"node": "implement"})
+        self.assertIn("invented_fact", str(context.exception))
+
+    def test_a_project_installed_before_this_transport_degrades_instead_of_crashing(self):
+        self.apply_init()
+        # Exactly what an older install looks like: no registry, no prompt home.
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        del config["automation"]["sessions"]
+        (self.repo / devflow.CONFIG_PATH).write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (self.repo / devflow.SESSION_ASSIGNMENT_TEMPLATE).unlink()
+        _, workflow, _ = devflow.load_project_state(self.repo)
+        self.assertEqual(devflow.validate_config(config)[0], [])
+        report = devflow.session_report(self.repo, config, workflow)
+        self.assertEqual(report["mode"], "undecided")
+        sessions = next(item for item in devflow.doctor(self.repo)["diagnosis"]
+                        if item["check"] == "sessions")
+        self.assertEqual(sessions["status"], "PARTIAL")
+        stage = next(item for item in devflow.evaluate_setup(self.repo)
+                     if item["stage"] == "automation")
+        self.assertTrue(any("automation.sessions" in gap for gap in stage["gaps"]))
+        # The shipped wording still renders, and upgrade restores the prompt home.
+        self.declare_sessions()
+        self.commit_fixture()
+        self.assertEqual(
+            devflow.session_assign(self.repo, "implement", "#17", pm_go="PM-77")["status"], "PASS")
+        devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "test-upgrade"))
+        self.assertTrue((self.repo / devflow.SESSION_ASSIGNMENT_TEMPLATE).is_file())
+
     def test_neutral_template_does_not_replace_a_configured_project_on_upgrade(self):
         self.apply_init()
         self.choose_executors(agent="claude-code", model=None, effort="high")

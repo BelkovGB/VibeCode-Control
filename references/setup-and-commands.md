@@ -155,6 +155,8 @@ devflow doctor [--deep] [--refresh-skills] [--repair-plan]
 devflow scheme check
 devflow scheme repair [--apply]
 devflow pipeline check
+devflow session check
+devflow session assign --node <id> --issue <ref> [--change-type <type>] [--pm-go <ref>]
 devflow operate --node <id> [--issue <ref>]
 devflow run record --node <id> --status <status> --head-sha <sha> --issue <ref> --pr <ref> --evidence "<expected_evidence>=<artifact-ref>" --check <name>=<conclusion> --human-decision <ref> --actual-agent <id> --actual-model <id> --actual-effort <level>
 devflow run show [run-id]

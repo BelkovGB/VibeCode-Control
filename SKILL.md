@@ -200,6 +200,8 @@ Before each background node:
 
 Guarantee delivery, explicit invocation, integrity, and objective outcome checks. Do not claim to prove that a model “mentally applied” a skill.
 
+Nodes can also be carried by chat sessions the owner created beforehand. Record the registry in `automation.sessions` — one session per role, never one session for both implementation and independent review — and render each assignment with `devflow session assign --node <id> --issue <ref>`, which prints the text and never sends it. A named session is a claim, not evidence: keep `automation.background_workers` a separate gate, and restart a node whole from its last run record if its session dies.
+
 ## Enforce evidence-based delivery
 
 Use the delivery path from `.agent-flow/workflow.json`. Treat model reviews as secondary controls; objective tests and quality gates provide the primary evidence.
