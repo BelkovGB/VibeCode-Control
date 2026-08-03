@@ -87,6 +87,7 @@ CLIENT_ADAPTERS: dict[str, dict[str, Any]] = {
         "managed_instructions": "AGENTS.md",
         "effort": ["low", "medium", "high", "xhigh"],
         "models": [],
+        "session_messaging": False,
     },
     "claude": {
         "agents": ["claude-code"],
@@ -95,6 +96,7 @@ CLIENT_ADAPTERS: dict[str, dict[str, Any]] = {
         "managed_instructions": "CLAUDE.md",
         "effort": ["low", "medium", "high", "xhigh", "max"],
         "models": [],
+        "session_messaging": True,
     },
 }
 # Legacy scalar spellings accepted on read so existing projects normalize without
@@ -152,6 +154,17 @@ GATE_SCOPE_REPOSITORY = "repository"
 WORKSPACE_ROLES = ("control_checkout", "issue_worktree", "scratch")
 WORKSPACE_MODES = {MODE_EXPLICIT, MODE_NOT_APPLICABLE, MODE_UNDECIDED}
 WORKSPACE_PERMISSIONS = ("changes", "dependencies", "tests")
+# Which chat session executes which role.  Sessions are a transport, not a source of
+# truth: the CLI never sees them, so the registry records what the owner declared and
+# says so.  The same three modes as everywhere else, so "nobody has chosen yet" cannot
+# be mistaken for "this project runs no sessions".
+SESSION_MODES = {MODE_EXPLICIT, MODE_NOT_APPLICABLE, MODE_UNDECIDED}
+SESSION_PROMPTS_DIR = f"{META_DIR}/prompts"
+SESSION_ASSIGNMENT_TEMPLATE = f"{SESSION_PROMPTS_DIR}/session-assignment.md"
+SESSION_LIVENESS_NOTE = (
+    "Реестр объявлен владельцем. CLI сессий не видит: жива ли сессия сейчас, "
+    "прочитала ли она постановку и тот ли это чат — локально не проверяется."
+)
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", "node_modules", "vendor",
     ".venv", "venv", "dist", "build", "coverage", ".next", ".turbo",
@@ -485,7 +498,12 @@ def plan_path_allowed(mode: str, relative: str) -> bool:
         ".agents/skills/devflow-node/SKILL.md", ".claude/skills/devflow-node/SKILL.md",
     }
     if mode in {"init", "adopt", "upgrade", "repair"}:
-        return relative in setup_exact or relative.startswith(f"{META_DIR}/toolkit/") or relative.startswith(".github/devflow/prompts/")
+        return (
+            relative in setup_exact
+            or relative.startswith(f"{META_DIR}/toolkit/")
+            or relative.startswith(".github/devflow/prompts/")
+            or relative.startswith(f"{SESSION_PROMPTS_DIR}/")
+        )
     if mode in {"config-set", "role-set", "model-set", "permissions-set"}:
         return relative in {CONFIG_PATH, SKILLS_LOCK_PATH}
     if mode == "graph-migrate":
@@ -889,6 +907,9 @@ def build_setup_plan(repo: Path, mode: str, purpose: str = "setup") -> dict[str,
     add(".github/ISSUE_TEMPLATE/devflow-task.yml", (managed / "devflow-task.yml").read_bytes())
     add(".github/devflow/prompts/claude-implement.md", (managed / "claude-implement.md").read_bytes())
     add(".github/devflow/prompts/codex-review.md", (managed / "codex-review.md").read_bytes())
+    # The session transport is deliberately usable without GitHub, so its prompt home is
+    # the control plane, not `.github/`.  See docs/ARCHITECTURE.md for the map.
+    add(SESSION_ASSIGNMENT_TEMPLATE, (managed / "session-assignment.md").read_bytes())
     background = (managed / "background-skill" / "SKILL.template.md").read_bytes()
     add(".agents/skills/devflow-node/SKILL.md", background)
     add(".claude/skills/devflow-node/SKILL.md", background)
@@ -1315,6 +1336,14 @@ def client_effort_vocabulary(client: str | None, registry: dict[str, dict[str, A
     return [str(item) for item in vocabulary] if isinstance(vocabulary, list) else []
 
 
+def client_supports_session_messaging(client: str | None, registry: dict[str, dict[str, Any]] | None = None) -> bool:
+    """A declared adapter capability, never a guess from the client name."""
+    if not client:
+        return False
+    registry = registry if registry is not None else CLIENT_ADAPTERS
+    return registry.get(client, {}).get("session_messaging") is True
+
+
 def client_registry_hint(client: str | None) -> str:
     return (
         f"расширьте реестр блоком clients.{client or '<client>'} в .agent-flow/config.json, "
@@ -1737,6 +1766,7 @@ def validate_config(config: dict[str, Any]) -> tuple[list[str], list[str]]:
                 _, role_errors = parse_workspace_role(
                     declared_workspaces[role], f"automation.workspaces.{role}")
                 errors.extend(role_errors)
+    errors.extend(session_transport_errors(config))
     plan = validation_plan_of(config)
     if not isinstance(config.get("quality", {}).get("validation_plan", {}), dict):
         errors.append("quality.validation_plan должен быть объектом")
@@ -2058,6 +2088,33 @@ def validate_workflow(workflow: dict[str, Any], config: dict[str, Any]) -> tuple
                     f"Узел {node_id}: {pointer} объявлен mode={MODE_NOT_APPLICABLE}, "
                     f"хотя агент {agent} исполняет модель; фактическое значение было бы нечем проверить"
                 )
+    # Context isolation, checked on the resolved node → session pairs rather than on
+    # roles: a session that implements must not be the one that reviews independently.
+    # Self-review stays legal by construction — `implementer_review` is a review-stage
+    # node of the implementer's own role, and the rule only fires on a foreign role.
+    if session_transport_of(config)["mode"] == MODE_EXPLICIT:
+        bound: dict[str, dict[str, list[tuple[str, str]]]] = {}
+        for node_id, node in sorted(nodes.items()):
+            stage = node.get("stage")
+            if stage not in {"implementation", "review"}:
+                continue
+            resolved = session_for_node(node, config)
+            if resolved["mode"] != MODE_EXPLICIT or not isinstance(resolved["session"], str):
+                continue
+            slot = bound.setdefault(resolved["session"], {"implementation": [], "review": []})
+            slot[stage].append((node_id, str(node.get("role"))))
+        for session in sorted(bound):
+            for review_id, review_role in bound[session]["review"]:
+                conflicting = sorted(
+                    node_id for node_id, role in bound[session]["implementation"]
+                    if role != review_role
+                )
+                if conflicting:
+                    errors.append(
+                        f"automation.sessions: сессия {session} исполняет узлы реализации "
+                        f"({', '.join(conflicting)}) и независимый review-узел {review_id}: "
+                        "изоляция контекстов нарушена — разные сессии и есть разные контексты"
+                    )
     return errors, warnings
 
 
@@ -3107,13 +3164,23 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         automation_gaps.append("devflow-node is not present for both background agents")
     if not inspection["quality"]["ci_workflows"]:
         automation_gaps.append("CI executor is not configured")
+    # Which transport carries the nodes is part of this stage: the template chooses
+    # none, so the owner says either "sessions" or "not applicable" before automation
+    # can be called configured.
+    sessions = session_report(repo, config, workflow)
+    automation_gaps.extend(sessions["errors"])
+    automation_gaps.extend(f"{item['pointer']}: {item['decision']}" for item in sessions["pending"])
     automation_status = "PARTIAL" if automation_gaps else "PASS"
     results.append(stage_result(
         "automation", automation_status,
-        [f"core background skills present={all(path.is_file() for path in core_skills)}"],
+        [f"core background skills present={all(path.is_file() for path in core_skills)}",
+         f"session transport={sessions['mode']}"],
         automation_gaps,
-        "Verify runner checkout, explicit node prompt, model/effort inputs, permissions, required checks, and state-change notifications.",
-        following("automation"), "devflow doctor --deep", False
+        "Verify runner checkout, explicit node prompt, model/effort inputs, permissions, required checks, and state-change notifications. "
+        "For the session transport create the chats beforehand and name them in the registry; see references/adapters-and-security.md.",
+        following("automation"),
+        sessions["pending"][0]["command"] if sessions["pending"] else "devflow doctor --deep",
+        bool(sessions["pending"]),
     ))
 
     pilot = manual.get("pilot", {})
@@ -3219,10 +3286,23 @@ def mark_skill_revalidation(config: dict[str, Any], workflow: dict[str, Any], lo
 
 def configure_value(repo: Path, dotted: str, raw: str) -> dict[str, Any]:
     config, workflow, lock = load_project_state(repo)
+    previous_config = copy.deepcopy(config)
     deep_set(config, dotted, parse_jsonish(raw))
     errors, _ = validate_config(config)
     if errors:
         raise DevflowError("Конфигурация после изменения невалидна: " + "; ".join(errors))
+    # Some invariants are only visible with the graph in hand — the session isolation
+    # rule among them.  Comparing before and after refuses exactly what this change
+    # introduces, instead of locking the command out of a project whose graph is
+    # already broken for an unrelated reason.
+    introduced = sorted(
+        set(validate_workflow(workflow, config)[0])
+        - set(validate_workflow(workflow, previous_config)[0])
+    )
+    if introduced:
+        raise DevflowError(
+            "Изменение конфигурации ломает граф: " + "; ".join(introduced)
+        )
     if dotted.startswith("roles.") or dotted.startswith("node_overrides.") or dotted.startswith("models."):
         parts = dotted.split(".")
         target = parts[1] if len(parts) > 1 else ""
@@ -3924,6 +4004,7 @@ def doctor(repo: Path, deep: bool = False, refresh_skills: bool = False, repair_
     findings.append({"check": "project-cli", "status": "PASS" if (repo / META_DIR / "devflow.py").is_file() and toolkit.is_dir() else "BLOCKED", "version": configured_version, "running_version": VERSION})
     findings.append(managed_block_report(repo))
     findings.append(workspace_report(repo, config))
+    findings.append(session_report(repo, config, workflow))
 
     due = []
     today = utc_now().date()
@@ -4086,10 +4167,30 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
             external_gaps.append(
                 f"Узел {node_id} входит в цикл, но бюджет не вычислен: передайте --issue <ref>"
             )
+    transport: dict[str, Any] | None = None
     if effective.get("agent") not in {"human", "script", "deterministic"}:
         automation = config.get("automation", {}) if isinstance(config.get("automation", {}), dict) else {}
         if automation.get("background_workers") != "verified":
             external_gaps.append("Background executor availability is unverified")
+        # Two independent axes: which transport carries the node, and whether the owner
+        # ever observed that executor.  A named session is a claim; `verified` is the
+        # evidence, and neither substitutes for the other.
+        resolved_session = session_for_node(nodes[node_id], config)
+        if resolved_session["transport_mode"] == MODE_EXPLICIT:
+            transport = {
+                "kind": "sessions",
+                "client": resolved_session["client"],
+                "role": resolved_session["role"],
+                "session": resolved_session["session"],
+                "mode": resolved_session["mode"],
+                "liveness": SESSION_LIVENESS_NOTE,
+            }
+            if resolved_session["mode"] == MODE_UNDECIDED:
+                external_gaps.append(
+                    f"Сессия для роли {resolved_session['role']} не названа: "
+                    f"`devflow config set {resolved_session['pointer']} "
+                    "'{\"mode\": \"explicit\", \"session\": \"<name>\"}'`"
+                )
     validation_verdict = verify_change_type(repo, config, change_type)
     stage = nodes[node_id].get("stage")
     if stage in {"review", "release"}:
@@ -4111,6 +4212,7 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
         "node": effective,
         "effective_configuration": effective_configuration(workflow, config, lock),
         "cycle_budget": budget,
+        "transport": transport,
         "self_modification": guarded_control_plane_changes(repo),
         "required_artifacts": evidence_contract_for(nodes[node_id]),
         "validation": validation_verdict,
@@ -4725,6 +4827,241 @@ def workspace_report(repo: Path, config: Any) -> dict[str, Any]:
             "findings": findings, "pending": pending}
 
 
+def parse_session_role(raw: Any, pointer: str) -> tuple[dict[str, Any], list[str]]:
+    """Parse one role → session binding."""
+    errors: list[str] = []
+    if raw is None:
+        return {"mode": MODE_UNDECIDED}, errors
+    if not isinstance(raw, dict):
+        return {"mode": MODE_UNDECIDED}, [f"{pointer} должен быть объектом с полем mode"]
+    unknown = sorted(set(raw) - {"mode", "session"})
+    if unknown:
+        errors.append(f"{pointer} содержит неизвестные ключи: {', '.join(unknown)}")
+    mode = raw.get("mode")
+    if mode not in SESSION_MODES:
+        return {"mode": MODE_UNDECIDED}, errors + [
+            f"{pointer}.mode должен быть одним из: " + ", ".join(sorted(SESSION_MODES))
+        ]
+    if mode != MODE_EXPLICIT:
+        if raw.get("session") is not None:
+            errors.append(f"{pointer}.session недопустим при mode={mode}")
+        return {"mode": mode}, errors
+    name = raw.get("session")
+    if not isinstance(name, str) or not name.strip():
+        errors.append(
+            f"{pointer}.session обязателен и непуст при mode={MODE_EXPLICIT}: "
+            "имя заранее созданной сессии"
+        )
+        return {"mode": MODE_EXPLICIT}, errors
+    return {"mode": MODE_EXPLICIT, "session": name.strip()}, errors
+
+
+def session_transport_of(config: Any) -> dict[str, Any]:
+    """The declared session transport, parsed but not validated against the graph."""
+    automation = config.get("automation") if isinstance(config, dict) else {}
+    automation = automation if isinstance(automation, dict) else {}
+    raw = automation.get("sessions")
+    if not isinstance(raw, dict):
+        return {"mode": MODE_UNDECIDED, "roles": {}}
+    mode = raw.get("mode") if raw.get("mode") in SESSION_MODES else MODE_UNDECIDED
+    transport: dict[str, Any] = {"mode": mode, "roles": {}}
+    if isinstance(raw.get("client"), str) and raw["client"].strip():
+        transport["client"] = raw["client"].strip()
+    declared = raw.get("roles")
+    if isinstance(declared, dict):
+        for role, entry in declared.items():
+            parsed, _ = parse_session_role(entry, f"automation.sessions.roles.{role}")
+            transport["roles"][role] = parsed
+    return transport
+
+
+def session_transport_errors(config: Any) -> list[str]:
+    automation = config.get("automation") if isinstance(config, dict) else {}
+    automation = automation if isinstance(automation, dict) else {}
+    raw = automation.get("sessions")
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return ["automation.sessions должен быть объектом с полем mode"]
+    errors: list[str] = []
+    unknown = sorted(set(raw) - {"mode", "client", "roles"})
+    if unknown:
+        errors.append(f"automation.sessions содержит неизвестные ключи: {', '.join(unknown)}")
+    mode = raw.get("mode")
+    if mode not in SESSION_MODES:
+        return errors + [
+            "automation.sessions.mode должен быть одним из: " + ", ".join(sorted(SESSION_MODES))
+        ]
+    declared_roles = raw.get("roles")
+    if declared_roles is not None and not isinstance(declared_roles, dict):
+        errors.append("automation.sessions.roles должен быть объектом")
+        declared_roles = {}
+    declared_roles = declared_roles if isinstance(declared_roles, dict) else {}
+    if mode != MODE_EXPLICIT:
+        for field in ("client", "roles"):
+            if raw.get(field) is not None:
+                errors.append(f"automation.sessions.{field} недопустим при mode={mode}")
+        return errors
+    client = raw.get("client")
+    registry = client_registry(config)
+    if not isinstance(client, str) or not client.strip():
+        errors.append(
+            f"automation.sessions.client обязателен при mode={MODE_EXPLICIT}: "
+            "межсессионные сообщения — способность конкретного клиента"
+        )
+    elif client.strip() not in registry:
+        errors.append(
+            f"automation.sessions.client: неизвестный клиент {client.strip()}; известны: "
+            + ", ".join(sorted(registry))
+            + "; новый клиент объявляется блоком clients в .agent-flow/config.json"
+        )
+    elif not client_supports_session_messaging(client.strip(), registry):
+        # The capability is declared by the adapter, so a client that gains it later
+        # is enabled by extending the registry, not by editing this rule.
+        errors.append(
+            f"automation.sessions.client: адаптер {client.strip()} не объявляет "
+            "session_messaging; транспорт сессий для него недоступен и не эмулируется"
+        )
+    configured_roles = config.get("roles") if isinstance(config, dict) else {}
+    configured_roles = configured_roles if isinstance(configured_roles, dict) else {}
+    for role in sorted(set(declared_roles) - set(configured_roles)):
+        errors.append(
+            f"automation.sessions.roles.{role}: роль не объявлена в config.roles"
+        )
+    transport_client = client.strip() if isinstance(client, str) else ""
+    for role in sorted(declared_roles):
+        pointer = f"automation.sessions.roles.{role}"
+        entry, role_errors = parse_session_role(declared_roles[role], pointer)
+        errors.extend(role_errors)
+        if entry.get("mode") != MODE_EXPLICIT or role not in configured_roles:
+            continue
+        # Catch the mismatch one floor earlier than the run record does: an agent of
+        # another client cannot execute in this client's chat, and an agent that
+        # executes no model receives no assignment at all.  `unresolved` is left alone
+        # — the roles stage already carries that pending decision.
+        agent = role_agent(config, role)
+        if not agent or agent == AGENT_UNRESOLVED:
+            continue
+        if agent in NON_EXECUTING_AGENTS:
+            errors.append(
+                f"{pointer}: агент {agent} не исполняет модель и не получает постановок "
+                f"через транспорт сессий; допустим только mode={MODE_NOT_APPLICABLE}"
+            )
+            continue
+        agent_client = client_for_agent(agent, registry)
+        if transport_client and agent_client and agent_client != transport_client:
+            errors.append(
+                f"{pointer}: агент {agent} принадлежит клиенту {agent_client}, "
+                f"а транспорт объявлен для {transport_client}; сессия чужого клиента "
+                "его не исполнит"
+            )
+    return errors
+
+
+def role_agent(config: Any, role: Any) -> str:
+    roles = config.get("roles") if isinstance(config, dict) else {}
+    settings = roles.get(role) if isinstance(roles, dict) else None
+    agent = settings.get("agent") if isinstance(settings, dict) else None
+    return agent.strip() if isinstance(agent, str) else ""
+
+
+def session_for_node(node: Any, config: Any) -> dict[str, Any]:
+    """Resolve which session executes a node, through its role."""
+    transport = session_transport_of(config)
+    role = node.get("role") if isinstance(node, dict) else None
+    entry = transport["roles"].get(role) if isinstance(role, str) else None
+    entry = entry if isinstance(entry, dict) else {"mode": MODE_UNDECIDED}
+    agent = role_agent(config, role)
+    mode = entry.get("mode", MODE_UNDECIDED)
+    derived = False
+    if mode == MODE_UNDECIDED and agent in NON_EXECUTING_AGENTS:
+        # An agent that executes no model receives no assignment through this
+        # transport by definition.  That is a fact the engine knows, so it is derived
+        # here instead of being asked of the owner and written into the configuration.
+        # `unresolved` is not such a fact: nobody has chosen an executor yet.
+        mode = MODE_NOT_APPLICABLE
+        derived = True
+    return {
+        "transport_mode": transport["mode"],
+        "client": transport.get("client"),
+        "role": role,
+        "agent": agent,
+        "mode": mode,
+        "derived": derived,
+        "session": entry.get("session"),
+        "pointer": f"automation.sessions.roles.{role}",
+    }
+
+
+def pending_session_decisions(config: Any, workflow: Any) -> list[dict[str, str]]:
+    """One decision per role the graph actually uses, never per unused role."""
+    transport = session_transport_of(config)
+    if transport["mode"] == MODE_UNDECIDED:
+        return [{
+            "pointer": "automation.sessions",
+            "decision": "Объявите транспорт сессий или его неприменимость",
+            "command": "devflow config set automation.sessions '{\"mode\": \"not-applicable\"}'",
+        }]
+    if transport["mode"] != MODE_EXPLICIT:
+        return []
+    nodes = workflow.get("nodes") if isinstance(workflow, dict) else []
+    nodes = nodes if isinstance(nodes, list) else []
+    pending: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        resolved = session_for_node(node, config)
+        role = resolved["role"]
+        if not isinstance(role, str) or role in seen:
+            continue
+        if resolved["mode"] != MODE_UNDECIDED:
+            continue
+        seen.add(role)
+        pending.append({
+            "pointer": resolved["pointer"],
+            "decision": f"Назовите заранее созданную сессию для роли {role} или объявите роль неприменимой",
+            "command": (
+                f"devflow config set {resolved['pointer']} "
+                "'{\"mode\": \"explicit\", \"session\": \"<name>\"}'"
+            ),
+        })
+    return pending
+
+
+def session_report(repo: Path, config: Any, workflow: Any) -> dict[str, Any]:
+    """What the declared session registry says — and what it cannot prove."""
+    del repo
+    transport = session_transport_of(config)
+    errors = session_transport_errors(config)
+    pending = pending_session_decisions(config, workflow)
+    bindings: dict[str, Any] = {}
+    derived: list[str] = []
+    nodes = workflow.get("nodes") if isinstance(workflow, dict) else []
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str):
+            continue
+        resolved = session_for_node(node, config)
+        if resolved["mode"] == MODE_EXPLICIT:
+            bindings[node["id"]] = resolved["session"]
+        elif resolved["derived"] and resolved["role"] not in derived:
+            derived.append(str(resolved["role"]))
+    status = "BLOCKED" if errors else ("PARTIAL" if pending else "PASS")
+    if transport["mode"] == MODE_NOT_APPLICABLE:
+        status = "BLOCKED" if errors else "NOT_APPLICABLE"
+    return {
+        "check": "sessions",
+        "status": status,
+        "mode": transport["mode"],
+        "client": transport.get("client"),
+        "bindings": bindings,
+        "derived_not_applicable": sorted(derived),
+        "errors": errors,
+        "pending": pending,
+        "liveness": SESSION_LIVENESS_NOTE,
+    }
+
+
 def pathlib_relative_to_repo(repo: Path, candidate: str) -> str | None:
     try:
         return Path(candidate).resolve().relative_to(repo.resolve()).as_posix()
@@ -4755,6 +5092,168 @@ def parse_check_results(items: list[str] | None) -> dict[str, str]:
 def evidence_contract_for(node: dict[str, Any]) -> dict[str, dict[str, Any]]:
     contract = node.get("evidence_contract")
     return contract if isinstance(contract, dict) else {}
+
+
+def session_assignment_template(repo: Path) -> str:
+    installed = repo / SESSION_ASSIGNMENT_TEMPLATE
+    if installed.is_file():
+        return installed.read_text(encoding="utf-8")
+    shipped = find_project_kit(repo) / "managed" / "session-assignment.md"
+    if shipped.is_file():
+        # An installed project that predates this transport has no template yet, so the
+        # shipped wording is used and the migration is named instead of failing.
+        return shipped.read_text(encoding="utf-8")
+    raise DevflowError(
+        f"Шаблон постановки не найден: {SESSION_ASSIGNMENT_TEMPLATE}; выполните `devflow upgrade --apply`"
+    )
+
+
+def render_session_assignment(template: str, values: dict[str, str]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace("{{" + key + "}}", value)
+    leftover = sorted(set(re.findall(r"\{\{([a-z_]+)\}\}", rendered)))
+    if leftover:
+        raise DevflowError(
+            "Шаблон постановки запрашивает факты, которых CLI не предоставляет: "
+            + ", ".join(leftover)
+        )
+    return rendered
+
+
+def session_authorization(repo: Path, issue_key: str, pm_go: str) -> dict[str, Any]:
+    """Whether the coordinator may assign this task on the current chain budget.
+
+    Four cases that must not collapse into each other: a manual budget renders only
+    against a named PM go; a spent budget still lets an already counted Issue continue,
+    because the budget counts tasks and dropping half-done work is not what it bought;
+    a new Issue on a spent budget is refused; anything else renders.
+    """
+    pipeline = pipeline_check(repo)
+    budget = pipeline.get("budget", {})
+    reference = pm_go.strip() if isinstance(pm_go, str) else ""
+    if pipeline.get("errors"):
+        return {"allowed": False, "reason": pipeline.get("reason", ""), "pipeline": pipeline}
+    if budget.get("mode") == "manual":
+        if not reference:
+            return {
+                "allowed": False,
+                "reason": (
+                    "Автоцепочка выключена: каждая задача стартует по явному го PM. "
+                    "Передайте --pm-go <ref>, и ссылка попадёт в текст постановки."
+                ),
+                "pipeline": pipeline,
+            }
+        return {"allowed": True, "kind": "pm-go", "ref": reference, "pipeline": pipeline}
+    if not pipeline.get("allowed"):
+        if issue_key and issue_key in set(pipeline.get("consumed", [])):
+            return {
+                "allowed": True,
+                "kind": "chain-budget",
+                "ref": str(budget.get("decision_ref") or ""),
+                "continuation": True,
+                "pipeline": pipeline,
+            }
+        return {"allowed": False, "reason": pipeline.get("reason", ""), "pipeline": pipeline}
+    return {
+        "allowed": True,
+        "kind": "chain-budget",
+        "ref": str(budget.get("decision_ref") or ""),
+        "pipeline": pipeline,
+    }
+
+
+def session_assign(repo: Path, node: str, issue: str, change_type: str = "",
+                   pm_go: str = "") -> dict[str, Any]:
+    """Render the assignment for one node.  Printing is the whole job: the CLI never
+    sees sessions, so delivery stays with the coordinator."""
+    config, workflow, lock = load_project_state(repo)
+    del lock
+    nodes = {item["id"]: item for item in workflow["nodes"] if isinstance(item, dict)}
+    if node not in nodes:
+        raise DevflowError(f"Неизвестный узел: {node}")
+    config_errors, _ = validate_config(config)
+    workflow_errors, _ = validate_workflow(workflow, config)
+    if config_errors or workflow_errors:
+        raise DevflowError(
+            "Постановка невозможна на некорректном управляющем слое: "
+            + " | ".join(config_errors + workflow_errors)
+        )
+    resolved = session_for_node(nodes[node], config)
+    if resolved["transport_mode"] != MODE_EXPLICIT:
+        raise DevflowError(
+            f"Транспорт сессий не объявлен (automation.sessions.mode={resolved['transport_mode']}): "
+            "объявите его или используйте другой транспорт"
+        )
+    if resolved["mode"] != MODE_EXPLICIT:
+        raise DevflowError(
+            f"Для роли {resolved['role']} не названа сессия ({resolved['pointer']}.mode="
+            f"{resolved['mode']}): `devflow config set {resolved['pointer']} "
+            "'{\"mode\": \"explicit\", \"session\": \"<name>\"}'`"
+        )
+    issue_reference = issue.strip() if isinstance(issue, str) else ""
+    if not issue_reference:
+        raise DevflowError("Постановка требует --issue <ref>: узел исполняется по конкретной задаче")
+    authorization = session_authorization(repo, normalize_issue_key(issue_reference) or "", pm_go)
+    if not authorization["allowed"]:
+        return {
+            "status": "BLOCKED",
+            "node": node,
+            "issue": issue_reference,
+            "session": resolved["session"],
+            "reason": authorization["reason"],
+            "pipeline": authorization["pipeline"],
+        }
+    code, head, _ = run_process(["git", "rev-parse", "HEAD"], repo)
+    if code != 0 or not head.strip():
+        raise DevflowError("Локальный Git обязателен для постановки: head SHA не определён")
+    head = head.strip()
+    preflight = f"devflow operate --node {shlex.quote(node)} --issue {shlex.quote(issue_reference)}"
+    if isinstance(change_type, str) and change_type.strip():
+        preflight += f" --change-type {shlex.quote(change_type.strip())}"
+    record = (
+        f"devflow run record --node {shlex.quote(node)} --status <PASS|PARTIAL|BLOCKED|FAIL> "
+        f"--issue {shlex.quote(issue_reference)} --head-sha {head}"
+    )
+    contract = evidence_contract_for(nodes[node])
+    expected = []
+    for name in nodes[node].get("expected_evidence", []) or []:
+        requirement = contract.get(str(name)) if isinstance(contract, dict) else None
+        if isinstance(requirement, dict) and requirement.get("required", True):
+            expected.append(f"- `{name}` — required artifact of kind `{requirement.get('kind')}`, "
+                            f"recorded as `{name}=<kind>:<reference>`")
+        else:
+            expected.append(f"- `{name}`")
+    text = render_session_assignment(session_assignment_template(repo), {
+        "session": str(resolved["session"]),
+        "role": str(resolved["role"]),
+        "node": node,
+        "issue": issue_reference,
+        "head_sha": head,
+        "authorization_kind": str(authorization["kind"]),
+        "authorization_ref": str(authorization["ref"]) or "—",
+        "expected_evidence": "\n".join(expected) if expected else "- (node declares none)",
+        "preflight_command": expand_devflow_command(repo, preflight)[0] or preflight,
+        "record_command": expand_devflow_command(repo, record)[0] or record,
+    })
+    return {
+        "status": "PASS",
+        "node": node,
+        "role": resolved["role"],
+        "issue": issue_reference,
+        "issue_key": normalize_issue_key(issue_reference),
+        "session": resolved["session"],
+        "client": resolved["client"],
+        "head_sha": head,
+        "authorization": {
+            "kind": authorization["kind"],
+            "ref": authorization["ref"],
+            "continuation": bool(authorization.get("continuation")),
+        },
+        "delivery": "CLI печатает постановку и не отправляет её: доставка остаётся за координатором.",
+        "liveness": SESSION_LIVENESS_NOTE,
+        "assignment": text,
+    }
 
 
 def record_run(repo: Path, node: str, status: str, head_sha: str, issue: str, pr: str,
@@ -5291,6 +5790,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference to the PM decision that authorizes continuing past a spent cycle budget",
     )
 
+    session = sub.add_parser("session", help="Session transport: registry state and node assignments")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_sub.add_parser("check", help="Report the declared session registry and what it cannot prove")
+    session_assign_parser = session_sub.add_parser(
+        "assign", help="Render the assignment text for one node; delivery stays with the coordinator"
+    )
+    session_assign_parser.add_argument("--node", required=True)
+    session_assign_parser.add_argument("--issue", required=True)
+    session_assign_parser.add_argument("--change-type", default="")
+    session_assign_parser.add_argument(
+        "--pm-go",
+        default="",
+        metavar="REF",
+        help="Reference to the explicit PM go that authorizes this task while the chain budget is manual",
+    )
+
     run = sub.add_parser("run", help="Record or inspect background run evidence")
     run_sub = run.add_subparsers(dest="run_command", required=True)
     run_record = run_sub.add_parser("record")
@@ -5589,6 +6104,16 @@ def execute(args: argparse.Namespace) -> int:
         result = operate_preflight(repo, args.node, args.issue, args.human_decision, args.change_type)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
+    if args.command == "session":
+        if args.session_command == "check":
+            config, workflow, _ = load_project_state(repo)
+            report = session_report(repo, config, workflow)
+            print_json(report)
+            return 0 if report["status"] in {"PASS", "NOT_APPLICABLE"} else 1
+        if args.session_command == "assign":
+            result = session_assign(repo, args.node, args.issue, args.change_type, args.pm_go)
+            print_json(result)
+            return 0 if result["status"] == "PASS" else 1
     if args.command == "run":
         if args.run_command == "record":
             print_json(record_run(

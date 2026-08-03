@@ -70,13 +70,62 @@
     "github": {"type": "object"},
     "automation": {
       "type": "object",
-      "properties": {"pipeline": {"$ref": "#/$defs/pipelineBudget"}},
+      "properties": {
+        "pipeline": {"$ref": "#/$defs/pipelineBudget"},
+        "sessions": {"$ref": "#/$defs/sessionTransport"}
+      },
       "additionalProperties": true
     },
     "telemetry": {"type": "object"}
   },
   "additionalProperties": true,
   "$defs": {
+    "sessionTransport": {
+      "title": "Session transport registry",
+      "description": "Which pre-created chat session executes which role. Sessions are a transport, not a source of truth: the CLI never sees them, so this records what the owner declared. `undecided` is what the neutral template ships and blocks setup; `not-applicable` is a decision that this project runs no sessions. Under `explicit` the client must be an adapter that declares `session_messaging`, and every role name must exist in `config.roles`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {"mode": {"enum": ["not-applicable", "undecided"]}},
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode", "client"],
+          "properties": {
+            "mode": {"const": "explicit"},
+            "client": {"type": "string", "minLength": 1},
+            "roles": {
+              "type": "object",
+              "additionalProperties": {"$ref": "#/$defs/sessionRole"}
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "sessionRole": {
+      "title": "Role to session binding",
+      "description": "The name of a chat session the owner created beforehand. `not-applicable` means this role is not executed through a session; `undecided` means nobody has chosen yet.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["mode", "session"],
+          "properties": {
+            "mode": {"const": "explicit"},
+            "session": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {"mode": {"enum": ["not-applicable", "undecided"]}},
+          "additionalProperties": false
+        }
+      ]
+    },
     "pipelineBudget": {
       "title": "Autonomous chain budget",
       "description": "Bounds how many tasks the coordinator may run in a row. `manual` runs nothing autonomously and is the shipped default. `count` and `until` are PM decisions and therefore require a non-empty decision_ref; changing the mode or value under the same reference is refused as a silent extension.",

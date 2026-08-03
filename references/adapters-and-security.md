@@ -4,12 +4,13 @@
 
 1. Enforcement boundary
 2. Client portability boundary
-3. Background Codex and Claude
-4. Managed instructions and guarded paths
-5. Git and GitHub audit
-6. CI/CD gates
-7. Observability
-8. Security boundaries
+3. Session transport
+4. Background Codex and Claude
+5. Managed instructions and guarded paths
+6. Git and GitHub audit
+7. CI/CD gates
+8. Observability
+9. Security boundaries
 
 ## Enforcement boundary
 
@@ -28,6 +29,47 @@ Moving a stage between clients does not carry the source client's chosen model o
 The reset cascades into `node_overrides`. An override that names no agent of its own resolves against the role's client, so its chosen values would otherwise slip past the reset one level down; an override that names its own agent keeps its own client and its values.
 
 Which agents exist is not guessed. The engine ships a registry of client adapters — agent identifiers, project and personal skill roots, managed instruction file, and the effort vocabulary the client can express — and a project extends it with an optional `clients` block in `.agent-flow/config.json`. The registry lives in the engine rather than the kit because `devflow install` runs without a project at all, and a copy of engine facts inside a guarded configuration would go stale without `upgrade` ever replacing it. Any reference in `roles.*.agent` or `node_overrides.*.agent` to an agent that no adapter declares is a validation error naming the exact pointer, which is what catches a typo such as `devflow_development` against `devflow-development`. Client membership is exact: a name that merely contains `codex` or `claude` is not that client. Resolve the parameters again for the target client: an `explicit` value is chosen anew, an `inherited` value is observed in the new client at run time and recorded, and an `unset` parameter stays absent instead of acquiring the previous client's default.
+
+## Session transport
+
+Nodes can be executed by chat sessions the owner created beforehand, coordinated by messages between those sessions. This runs the full `Issue → implementation → review → merge` cycle without GitHub Actions or cloud runners, and context isolation comes for free: different sessions are different contexts.
+
+Whether a client can carry messages between sessions is an adapter capability, `session_messaging`, not an inference from the client name. The engine declares it `true` for `claude` and `false` for `codex`; a project whose client gained the capability extends the registry with a `clients` block instead of editing the rule.
+
+### Create the chats before configuring
+
+The CLI never creates, starts, or sees sessions. Create them first, then record them:
+
+1. Decide which roles this project executes through sessions. One chat per role is the usual shape; the implementer and the independent reviewer must be different chats, and the CLI refuses a registry where one session holds both.
+2. Create each chat in the client and give it a name you will not change — the registry stores the name, and a renamed chat silently stops matching.
+3. Open each chat once and let it read the repository rules and `.agent-flow` configuration, so it starts from the project's own canon rather than from the assignment text.
+4. Record the registry, one role at a time:
+
+```bash
+devflow config set automation.sessions '{"mode": "explicit", "client": "claude", "roles": {}}'
+devflow config set automation.sessions.roles.implementer '{"mode": "explicit", "session": "<chat name>"}'
+devflow config set automation.sessions.roles.reviewer '{"mode": "explicit", "session": "<chat name>"}'
+```
+
+The registry is checked against the roles it names. A role whose agent belongs to a different client cannot be bound to this transport's sessions, and neither can a role whose agent executes no model — both are refused at write time with the exact pointer, instead of surfacing later as a mismatched `actual_agent` in a run record. A role whose executor is still `unresolved` may be bound; that decision is already pending on the `roles` stage. Roles executed by `human`, `script`, or `deterministic` are never asked about a session, because an agent that executes no model receives no assignment here by definition.
+
+A role this project does not execute through a session is `{"mode": "not-applicable"}`. A project that runs no sessions at all declares `automation.sessions` as `{"mode": "not-applicable"}`. The shipped template declares `{"mode": "undecided"}` and chooses nothing, so the `automation` setup stage asks. Run `devflow session check` to see the resolved node → session bindings, and `devflow doctor` to see the same as one finding.
+
+### Assign a node
+
+```bash
+devflow session assign --node implement --issue 17
+```
+
+The command renders the assignment and prints it. It does not send it: delivery stays with the coordinator, because the CLI has no way to reach a chat. The text carries the session name, the node, the Issue, the actual head SHA from local Git, the expected evidence taken from the node's `evidence_contract`, the exact preflight command, the command that produces the answer, and the restart rule. The wording lives in `.agent-flow/prompts/session-assignment.md` and can be changed by the project; the facts are always filled by the CLI, so nothing is retyped and nothing drifts.
+
+Assignment is bound to the chain budget. While `automation.pipeline` is `manual` the command refuses to render without `--pm-go <ref>`, and that reference is written into the assignment text. On a spent budget a new Issue is refused, while an Issue the budget already counted still renders — the budget counts tasks, and refusing to continue one would throw away half-finished work.
+
+### What this transport does not prove
+
+A named session is the owner's claim, not evidence. Liveness of a session, delivery of an assignment, and the identity of the chat behind a name are not locally verifiable, and every surface says so instead of implying a pass: `session check`, the `transport` field of `devflow operate`, and the rendered assignment. `automation.background_workers: verified` remains a separate gate that the owner sets after actually observing a run, exactly as for background runners.
+
+If a session dies in the middle of a node, the node restarts whole from the last recorded `run record`. That record and its head SHA are the checkpoint; nobody resumes a dead session from the middle.
 
 ## Background Codex and Claude
 
