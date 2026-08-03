@@ -188,6 +188,21 @@ The count comes from the local run-record history of this checkout, and `.agent-
 
 `devflow doctor` reports what it can check locally: a declared directory that does not exist, a control checkout that doubles as the issue worktree, dependency installation permitted inside the control checkout, and a scratch directory that lives inside the repository without being ignored by git.
 
+### Routing a node to another model
+
+`node_overrides.<node>.model` and `.effort` route one node to a different model than its role uses. The typical motive is cost — writing tests from an exact specification is mechanical, designing them is not — but the CLI never ranks models by price: it has no price oracle, and ordering them would be inventing data. What it observes is the fact itself: the node's model came from a node override and differs from the role's.
+
+```bash
+devflow model set tdd_red <model> --effort <level>
+devflow config effective --format table
+```
+
+That difference has a consequence, and the CLI enforces it. When `tdd_red` runs on a different model than the `implementer` role, the tests are written by a context that did not design them, so the specification becomes the contract between the two: `devflow operate --node tdd_red --issue <ref>` is `BLOCKED` until the `design` node has recorded a `test spec` reference for that Issue. When both levels resolve to the same model there is no second context and no contract to demand — the requirement never becomes a permanent gap for projects that do not route.
+
+The reference is checked as far as it can be. If it resolves to a file in this repository, preflight runs the specification check itself and reports the verdict, so "the reference exists and the specification is garbage" cannot pass; if it points outside, preflight says in words that the content is not locally verifiable and neither blocks nor claims a pass.
+
+Two rules belong to the configuration rather than to the run. Routing is declared in advance because changing a model in the middle of a session discards the accumulated prefix cache — a mid-flight switch costs more than it saves. And the choice of tier is justified by the node's measured spend, not by intuition; until that measurement exists, state what the choice rests on instead of implying the tool measured it.
+
 `project.scale` declares the project's scale profile: `{"mode": "explicit", "value": "startup", "decision_ref": "PM-42"}` or `{"mode": "undecided"}`, which is what the neutral template ships and what stops the `context` setup stage. There is no `not-applicable`: every project has a scale. Choosing one is a PM decision, so `decision_ref` is required for the first choice as much as for a later one, and `devflow scale set <profile> --decision-ref <ref>` is the command that carries it. Changing the profile under the recorded reference is refused as a silent rescale; an identical repeat is not a change and passes.
 
 The seven shipped profiles live in `.agent-flow/scale-profiles.json`, installed from the kit and refreshed by `upgrade`. A project extends the table with `project.scale_profiles`, which merges key by key like `clients`: it may add its own profile and override a shipped one — including turning `promotion_watch` off with an explicit `false`. Each profile carries two parts that must not be confused. `gate_defaults` are values the CLI owns and compares — `quality.baseline_status`, `policy.max_fix_cycles`, `policy.tdd_for_behavior_changes`, and `github.required_checks_minimum` against the number of configured required checks. `complexity_budget` is a declared set of limits with a rationale that the CLI prints in `operate` and in the rendered session assignment but never measures; the `design` node proposes against it and `final_review` checks that the solution matches it.

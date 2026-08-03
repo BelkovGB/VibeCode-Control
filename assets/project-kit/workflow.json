@@ -100,9 +100,14 @@
       "role": "implementer",
       "permissions": "workspace-write-no-merge",
       "competencies": ["test design", "characterization testing", "TDD"],
-      "inputs": ["ready issue", "baseline", "assigned skills"],
+      "inputs": ["ready issue", "baseline", "assigned skills", "test spec"],
       "expected_evidence": ["failing test before implementation", "failure reason"],
-      "checks": ["test fails for intended reason", "guardrails unchanged"],
+      "checks": [
+        "test fails for intended reason",
+        "guardrails unchanged",
+        "every red test traces to a spec case and its expected failure reason",
+        "an ambiguous or incomplete spec is BLOCKED and returned, never improvised"
+      ],
       "timeout_minutes": 60
     },
     {

@@ -157,6 +157,7 @@ devflow scheme repair [--apply]
 devflow pipeline check
 devflow scale show
 devflow scale set <profile> --decision-ref <ref>
+devflow spec check <relative-path>
 devflow session check
 devflow session assign --node <id> --issue <ref> [--change-type <type>] [--pm-go <ref>]
 devflow operate --node <id> [--issue <ref>]

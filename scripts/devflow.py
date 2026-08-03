@@ -162,6 +162,15 @@ SESSION_MODES = {MODE_EXPLICIT, MODE_NOT_APPLICABLE, MODE_UNDECIDED}
 SESSION_PROMPTS_DIR = f"{META_DIR}/prompts"
 SESSION_ASSIGNMENT_TEMPLATE = f"{SESSION_PROMPTS_DIR}/session-assignment.md"
 SCALE_PROFILES_PATH = f"{META_DIR}/scale-profiles.json"
+TEST_SPEC_TEMPLATE = f"{META_DIR}/prompts/test-spec.md"
+# What a test case can be.  An engine fact like the gate kinds: a project that invents
+# a type would make the vocabulary unverifiable for everyone reading the record.
+TEST_SPEC_TYPES = ("unit", "integration", "contract", "e2e")
+TEST_SPEC_CRITERION_PATTERN = re.compile(r"^(FR|SC)-\d{3}$|^(US|AC)\d+$")
+TEST_SPEC_REMOTE_NOTE = (
+    "Ссылка на спеку нелокальна: содержимое по ней локально не проверяется — "
+    "структуру подтверждает тот, кто опубликовал документ."
+)
 SCALE_MODES = {MODE_EXPLICIT, MODE_UNDECIDED}
 # What a scale profile may propose.  The list is the whole reach of a profile: a key
 # outside it is a validation error, so the non-minimizable core is out of reach by
@@ -927,6 +936,7 @@ def build_setup_plan(repo: Path, mode: str, purpose: str = "setup") -> dict[str,
     # The session transport is deliberately usable without GitHub, so its prompt home is
     # the control plane, not `.github/`.  See docs/ARCHITECTURE.md for the map.
     add(SESSION_ASSIGNMENT_TEMPLATE, (managed / "session-assignment.md").read_bytes())
+    add(TEST_SPEC_TEMPLATE, (managed / "test-spec.md").read_bytes())
     background = (managed / "background-skill" / "SKILL.template.md").read_bytes()
     add(".agents/skills/devflow-node/SKILL.md", background)
     add(".claude/skills/devflow-node/SKILL.md", background)
@@ -4421,6 +4431,29 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
             external_gaps.append(
                 f"Узел {node_id} входит в цикл, но бюджет не вычислен: передайте --issue <ref>"
             )
+    # When a node runs on a different model than its role, the context that writes the
+    # tests is not the one that designed them, and the specification is the contract
+    # between them.  Same models, same context: no contract to demand.
+    routing = cross_model_routing(nodes[node_id], config)
+    test_spec: dict[str, Any] | None = None
+    if routing:
+        reference = test_spec_evidence(repo, issue)
+        test_spec = {"required_because": "cross-model-routing", **routing}
+        if not reference:
+            external_blockers.append(
+                f"Узел {node_id} исполняется моделью {routing['node_model']}, а роль "
+                f"{routing['role']} — моделью {routing['role_model']}: тесты пишет не тот контекст, "
+                "который их проектировал, поэтому нужна спека. Запишите её артефактом узла design "
+                "для этой задачи: `run record --node design ... --evidence 'test spec=<ref>'`"
+            )
+        else:
+            verdict = test_spec_verdict(repo, reference)
+            test_spec["spec"] = verdict
+            if verdict.get("local") and verdict.get("status") != "PASS":
+                external_blockers.append(
+                    "Спека по локальной ссылке не проходит проверку структуры: "
+                    + "; ".join(verdict.get("errors", []))
+                )
     transport: dict[str, Any] | None = None
     if effective.get("agent") not in {"human", "script", "deterministic"}:
         automation = config.get("automation", {}) if isinstance(config.get("automation", {}), dict) else {}
@@ -4473,6 +4506,7 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
             if key in {"mode", "profile", "decision_ref", "budget", "budget_note", "findings"}
         },
         "transport": transport,
+        "test_spec": test_spec,
         "self_modification": guarded_control_plane_changes(repo),
         "required_artifacts": evidence_contract_for(nodes[node_id]),
         "validation": validation_verdict,
@@ -5087,6 +5121,131 @@ def workspace_report(repo: Path, config: Any) -> dict[str, Any]:
             "findings": findings, "pending": pending}
 
 
+def parse_test_spec(text: str) -> dict[str, Any]:
+    """Read the declared criteria and cases out of a test specification.
+
+    Deliberately forgiving about prose and strict about the fields: the document is
+    written by a person or an agent, and everything outside the two lists is theirs.
+    """
+    criteria: list[dict[str, str]] = []
+    cases: list[dict[str, Any]] = []
+    section = None
+    current: dict[str, Any] | None = None
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        heading = re.fullmatch(r"#{1,6}\s+(.*)", line)
+        if heading:
+            title = heading.group(1).strip().lower()
+            if title.startswith("criteria"):
+                section, current = "criteria", None
+                continue
+            if title.startswith("cases"):
+                section, current = "cases", None
+                continue
+            if section == "cases" and title.startswith("case"):
+                current = {"id": heading.group(1).strip(), "line": number, "fields": {}}
+                cases.append(current)
+                continue
+            section, current = None, None
+            continue
+        if section == "criteria":
+            entry = re.fullmatch(r"[-*]\s+`([^`]+)`\s*(?:[-—:]\s*(.*))?", line)
+            if entry:
+                criteria.append({"id": entry.group(1).strip(), "text": (entry.group(2) or "").strip(),
+                                 "line": str(number)})
+            continue
+        if section == "cases" and current is not None:
+            field = re.fullmatch(r"[-*]\s+([A-Za-z ]+):\s*(.*)", line)
+            if field:
+                key = field.group(1).strip().lower()
+                value = field.group(2).strip().strip("`")
+                current["fields"][key] = value
+    return {"criteria": criteria, "cases": cases}
+
+
+def check_test_spec(text: str) -> dict[str, Any]:
+    """Validate a test specification.  Read-only by construction: text in, verdict out.
+
+    The link between a case and a criterion is checked in both directions, which is
+    what makes it a check rather than a keyword heuristic — the identifiers are
+    declared in this same document.  Whether those identifiers match the acceptance
+    criteria of the real Issue is not verifiable here and is never claimed.
+    """
+    parsed = parse_test_spec(text)
+    errors: list[str] = []
+    criteria_ids: list[str] = []
+    for item in parsed["criteria"]:
+        identifier = item["id"]
+        if not TEST_SPEC_CRITERION_PATTERN.fullmatch(identifier):
+            errors.append(
+                f"Критерий {identifier}: идентификатор должен быть FR-###, SC-###, US# или AC#"
+            )
+        if identifier in criteria_ids:
+            errors.append(f"Критерий {identifier} объявлен дважды: идентификаторы уникальны")
+        criteria_ids.append(identifier)
+        if not item["text"]:
+            errors.append(f"Критерий {identifier}: текст обязателен")
+    if not criteria_ids:
+        errors.append("Спека не объявляет ни одного критерия в разделе Criteria")
+    case_ids: list[str] = []
+    covered: set[str] = set()
+    for case in parsed["cases"]:
+        identifier = case["id"]
+        if identifier in case_ids:
+            errors.append(f"Кейс {identifier} объявлен дважды: идентификаторы уникальны")
+        case_ids.append(identifier)
+        fields = case["fields"]
+        for required in ("given", "when", "then"):
+            if not fields.get(required):
+                errors.append(f"Кейс {identifier}: поле {required.capitalize()} обязательно")
+        reason = fields.get("expected failure reason")
+        if not reason:
+            errors.append(
+                f"Кейс {identifier}: обязательна ожидаемая причина падения — "
+                "красный тест без неё ничего не доказывает"
+            )
+        kind = fields.get("type")
+        if kind not in TEST_SPEC_TYPES:
+            errors.append(
+                f"Кейс {identifier}: тип теста должен быть одним из: " + ", ".join(TEST_SPEC_TYPES)
+            )
+        criterion = fields.get("criterion")
+        if not criterion:
+            errors.append(f"Кейс {identifier}: не указан критерий, который он покрывает")
+        elif criterion not in criteria_ids:
+            errors.append(
+                f"Кейс {identifier}: критерий {criterion} не объявлен в разделе Criteria"
+            )
+        else:
+            covered.add(criterion)
+    if not case_ids:
+        errors.append("Спека не объявляет ни одного кейса в разделе Cases")
+    for identifier in criteria_ids:
+        if identifier not in covered:
+            errors.append(f"Критерий {identifier} не покрыт ни одним кейсом")
+    return {
+        "status": "BLOCKED" if errors else "PASS",
+        "criteria": criteria_ids,
+        "cases": case_ids,
+        "covered": sorted(covered),
+        "errors": errors,
+        "verified": "структура и двусторонняя связь кейсов и критериев внутри документа",
+        "not_verified": (
+            "соответствие идентификаторов фактическим acceptance criteria Issue — "
+            "это проверяет ревьюер"
+        ),
+    }
+
+
+def check_test_spec_file(repo: Path, relative: str) -> dict[str, Any]:
+    target = ensure_within(repo, relative)
+    if not target.is_file():
+        raise DevflowError(f"Файл спеки не найден: {relative}")
+    report = check_test_spec(target.read_text(encoding="utf-8"))
+    report["path"] = relative
+    return report
+
+
 def scale_profile_registry(repo: Path, config: Any = None) -> dict[str, dict[str, Any]]:
     """The shipped profiles, extended by an optional project block.
 
@@ -5399,6 +5558,79 @@ def pending_session_decisions(config: Any, workflow: Any) -> list[dict[str, str]
             ),
         })
     return pending
+
+
+def cross_model_routing(node: dict[str, Any], config: Any) -> dict[str, Any] | None:
+    """Whether this node runs on a different model than its role does.
+
+    Not "cheaper": the CLI has no price oracle, and ranking models by cost would be
+    inventing data.  What is observable is that the model came from a node override and
+    differs from the role's — the tests are then written by a context that did not
+    design them, which is exactly when the specification has to carry the contract
+    between the two.
+    """
+    resolution = resolve_execution_profile(node, config if isinstance(config, dict) else {})
+    model = resolution.get("model", {})
+    if model.get("source", {}).get("level") != "node-override" or model.get("mode") != MODE_EXPLICIT:
+        return None
+    roles = config.get("roles") if isinstance(config, dict) else {}
+    role = roles.get(node.get("role")) if isinstance(roles, dict) else None
+    role_entry, _ = parse_profile_value(
+        role.get("model") if isinstance(role, dict) else None, "roles.model"
+    )
+    if role_entry.get("mode") != MODE_EXPLICIT or role_entry.get("value") == model.get("value"):
+        return None
+    return {"node_model": model.get("value"), "role_model": role_entry.get("value"),
+            "role": node.get("role")}
+
+
+def test_spec_evidence(repo: Path, issue: str) -> str | None:
+    """The specification reference recorded by the design node for this Issue."""
+    key = normalize_issue_key(issue)
+    if not key:
+        return None
+    for record in reversed(iter_run_records(repo)):
+        if record.get("node") != "design":
+            continue
+        if (record.get("issue_key") or normalize_issue_key(record.get("issue"))) != key:
+            continue
+        named = record.get("evidence_by_name")
+        pairs: list[tuple[str, str]] = []
+        if isinstance(named, dict):
+            pairs.extend((str(name), str(reference)) for name, reference in named.items())
+        # A planning node records its evidence as a plain list: named evidence is only
+        # indexed for a delivery `PASS`, and `design` is deliberately not gated that way.
+        raw = record.get("evidence")
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str) and "=" in item:
+                    name, reference = (part.strip() for part in item.split("=", 1))
+                    pairs.append((name, reference))
+        for name, reference in pairs:
+            if "test spec" in name.lower() and reference.strip():
+                return reference.strip()
+    return None
+
+
+def test_spec_verdict(repo: Path, reference: str) -> dict[str, Any]:
+    """Check the referenced specification when the reference is local.
+
+    A reference is opaque by nature.  When it resolves to a file in this repository the
+    check is free, so the hole "the reference exists and the specification is garbage"
+    is closed here; when it does not, that is said in words instead of being turned into
+    a pass nobody verified.
+    """
+    candidate = reference.split("#", 1)[0].strip()
+    try:
+        target = ensure_within(repo, candidate) if candidate else None
+    except DevflowError:
+        target = None
+    if target is None or not target.is_file():
+        return {"reference": reference, "local": False, "note": TEST_SPEC_REMOTE_NOTE}
+    report = check_test_spec(target.read_text(encoding="utf-8"))
+    return {"reference": reference, "local": True, "path": candidate,
+            "status": report["status"], "errors": report["errors"],
+            "not_verified": report["not_verified"]}
 
 
 def scale_strictness(key: str, value: Any) -> int | None:
@@ -6305,6 +6537,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference to the PM decision that authorizes continuing past a spent cycle budget",
     )
 
+    spec = sub.add_parser("spec", help="Test specification: structure and case-criterion coverage")
+    spec_sub = spec.add_subparsers(dest="spec_command", required=True)
+    spec_check = spec_sub.add_parser("check", help="Validate a test specification; reads only")
+    spec_check.add_argument("path", help="Repository-relative path to the specification")
+
     scale = sub.add_parser("scale", help="Project scale profile: complexity budget and gate defaults")
     scale_sub = scale.add_subparsers(dest="scale_command", required=True)
     scale_sub.add_parser("show", help="Report the declared profile, its budget and gate drift")
@@ -6629,6 +6866,11 @@ def execute(args: argparse.Namespace) -> int:
         result = operate_preflight(repo, args.node, args.issue, args.human_decision, args.change_type)
         print_json(result)
         return 0 if result["status"] == "PASS" else 1
+    if args.command == "spec":
+        if args.spec_command == "check":
+            report = check_test_spec_file(repo, args.path)
+            print_json(report)
+            return 0 if report["status"] == "PASS" else 1
     if args.command == "scale":
         if args.scale_command == "show":
             report = scale_report(repo, load_json(repo / CONFIG_PATH))

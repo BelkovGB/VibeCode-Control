@@ -13,6 +13,7 @@ For delivery work:
 - Keep scope and priorities unchanged unless the PM approves a product change.
 - Classify task risk and map each acceptance criterion to a check and evidence.
 - For behavior changes, prove `RED`, then reach `GREEN`, then refactor.
+- When a node runs on a different model than its role, the tests are written by a context that did not design them: the test specification is the contract between them, and `tdd_red` stays blocked until the design node records it. Do not invent conditions the specification does not state — an ambiguous or incomplete spec is `BLOCKED` and goes back.
 - Do not weaken tests, lint, security rules, coverage thresholds, CI, or other guardrails.
 - Bind review, checks, and approval evidence to the current head SHA; a new commit invalidates stale evidence.
 - Merge only the exact verified SHA with every required check green and blocking thread resolved.
