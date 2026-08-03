@@ -2555,6 +2555,133 @@ class DevflowTestCase(unittest.TestCase):
         devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "test-upgrade"))
         self.assertTrue((self.repo / devflow.SESSION_ASSIGNMENT_TEMPLATE).is_file())
 
+    # --- design node ------------------------------------------------------------------
+
+    def downgrade_to_sixteen_nodes(self):
+        """Exactly what a graph installed before the design node looks like."""
+        workflow = devflow.load_json(self.repo / devflow.WORKFLOW_PATH)
+        workflow["nodes"] = [node for node in workflow["nodes"] if node["id"] != "design"]
+        workflow["edges"] = [edge for edge in workflow["edges"]
+                             if edge["from"] != "design" and edge["to"] != "design"]
+        workflow["edges"].insert(1, {"from": "product_scope_gate", "to": "prepare_issue",
+                                     "condition": "scope.approved", "max_retries": 0,
+                                     "on_failure": "human_needed"})
+        for node in workflow["nodes"]:
+            if node["id"] != "prepare_issue":
+                continue
+            node["entry_condition"] = "scope.approved"
+            node["inputs"] = [item for item in node["inputs"] if item != "design decision"]
+            node["checks"] = [item for item in node["checks"]
+                              if not item.startswith("architecture impact references")]
+        (self.repo / devflow.WORKFLOW_PATH).write_text(
+            json.dumps(workflow, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return workflow
+
+    def test_design_node_is_reachable_and_routes_its_two_outcomes(self):
+        kit = devflow.find_project_kit(self.repo)
+        workflow = devflow.load_json(kit / "workflow.json")
+        config = devflow.load_json(kit / "config.json")
+        self.assertEqual(len(workflow["nodes"]), 17)
+        design = next(node for node in workflow["nodes"] if node["id"] == "design")
+        self.assertEqual(design["role"], "architect")
+        self.assertEqual(design["stage"], "planning")
+        self.assertEqual(design["expected_evidence"], ["design decision", "test spec", "issue draft"])
+        routes = {edge["condition"]: (edge["to"], edge["max_retries"], edge["on_failure"])
+                  for edge in workflow["edges"] if edge["from"] == "design"}
+        self.assertEqual(routes["design.complete"], ("prepare_issue", 1, "human_needed"))
+        self.assertEqual(routes["design.decision_required"], ("human_needed", 0, "human_needed"))
+        self.assertEqual(
+            [edge["to"] for edge in workflow["edges"]
+             if edge["from"] == "product_scope_gate" and edge["condition"] == "scope.approved"],
+            ["design"])
+        # A discovered product choice ends in human_needed, so no planning cycle appears.
+        self.assertEqual([cycle["id"] for cycle in workflow["allowed_cycles"]], ["correction-loop"])
+        errors, warnings = devflow.validate_workflow(workflow, config)
+        self.assertEqual((errors, warnings), ([], []))
+
+    def test_prepare_issue_consumes_the_design_instead_of_repeating_it(self):
+        kit = devflow.find_project_kit(self.repo)
+        workflow = devflow.load_json(kit / "workflow.json")
+        node = next(item for item in workflow["nodes"] if item["id"] == "prepare_issue")
+        self.assertEqual(node["entry_condition"], "design.complete")
+        self.assertIn("design decision", node["inputs"])
+        self.assertTrue(any("references the design decision" in check for check in node["checks"]))
+        # #6 owns the test spec format, so it is not an input here yet.
+        self.assertNotIn("test spec", node["inputs"])
+
+    def test_the_design_node_adds_no_executor_and_no_isolation_verdict(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertEqual(config["roles"]["architect"]["agent"], devflow.AGENT_UNRESOLVED)
+        self.assertEqual(config["roles"]["architect"]["model"], {"mode": "undecided"})
+        self.apply_init()
+        self.choose_executors(agent="claude-code")
+        self.declare_sessions(extra={"architect": {"mode": "explicit", "session": "arch-chat"}})
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        self.assertEqual(devflow.validate_workflow(workflow, config)[0], [])
+        report = devflow.session_report(self.repo, config, workflow)
+        self.assertEqual(report["bindings"]["design"], "arch-chat")
+        # design is a planning node, so binding it to the implementer session is legal.
+        devflow.configure_value(self.repo, "automation.sessions.roles.architect",
+                                json.dumps({"mode": "explicit", "session": "impl-chat"}))
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        self.assertEqual(devflow.validate_workflow(workflow, config)[0], [])
+
+    def test_installed_sixteen_node_graph_migrates_with_one_command(self):
+        self.apply_init()
+        self.downgrade_to_sixteen_nodes()
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        self.assertEqual(len(workflow["nodes"]), 16)
+        # Nothing crashes before the migration: the old graph is still a valid graph.
+        self.assertEqual(devflow.validate_workflow(workflow, config)[0], [])
+        self.assertEqual(len(devflow.evaluate_setup(self.repo)), 11)
+        self.assertIn(devflow.doctor(self.repo)["status"], devflow.STATUS_VALUES)
+        plan = devflow.migrate_graph_contracts(self.repo, apply=False)
+        self.assertEqual(plan["added_nodes"], ["design"])
+        applied = devflow.migrate_graph_contracts(self.repo, apply=True)
+        self.assertEqual(applied["status"], "PASS")
+        migrated = devflow.load_json(self.repo / devflow.WORKFLOW_PATH)
+        self.assertEqual(len(migrated["nodes"]), 17)
+        self.assertEqual(
+            [edge["to"] for edge in migrated["edges"]
+             if edge["from"] == "product_scope_gate" and edge["condition"] == "scope.approved"],
+            ["design"])
+        successor = next(node for node in migrated["nodes"] if node["id"] == "prepare_issue")
+        self.assertEqual(successor["entry_condition"], "design.complete")
+        self.assertIn("design decision", successor["inputs"])
+        self.assertEqual(devflow.validate_workflow(migrated, config)[0], [])
+        self.assertEqual(devflow.migrate_graph_contracts(self.repo, apply=True)["status"],
+                         "NOT_APPLICABLE")
+
+    def test_migration_refuses_to_rewire_an_edge_this_project_changed(self):
+        self.apply_init()
+        workflow = self.downgrade_to_sixteen_nodes()
+        for edge in workflow["edges"]:
+            if edge["from"] == "product_scope_gate" and edge["condition"] == "scope.approved":
+                edge["max_retries"] = 2
+        (self.repo / devflow.WORKFLOW_PATH).write_text(
+            json.dumps(workflow, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        refused = devflow.migrate_graph_contracts(self.repo, apply=True)
+        self.assertEqual(refused["status"], "BLOCKED")
+        self.assertEqual(refused["added_nodes"], [])
+        self.assertTrue(any("max_retries=2" in item for item in refused["requires_explicit_decision"]))
+        self.assertEqual(len(devflow.load_json(self.repo / devflow.WORKFLOW_PATH)["nodes"]), 16)
+
+    def test_migration_refuses_to_rewrite_a_neighbour_this_project_changed(self):
+        self.apply_init()
+        workflow = self.downgrade_to_sixteen_nodes()
+        for node in workflow["nodes"]:
+            if node["id"] == "prepare_issue":
+                node["checks"].append("our own definition of ready")
+        (self.repo / devflow.WORKFLOW_PATH).write_text(
+            json.dumps(workflow, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        refused = devflow.migrate_graph_contracts(self.repo, apply=True)
+        self.assertEqual(refused["status"], "BLOCKED")
+        self.assertEqual(refused["added_nodes"], [])
+        self.assertTrue(any("собственные элементы checks" in item
+                            for item in refused["requires_explicit_decision"]))
+        self.assertEqual(len(devflow.load_json(self.repo / devflow.WORKFLOW_PATH)["nodes"]), 16)
+
     def test_neutral_template_does_not_replace_a_configured_project_on_upgrade(self):
         self.apply_init()
         self.choose_executors(agent="claude-code", model=None, effort="high")

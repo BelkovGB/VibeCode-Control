@@ -3449,15 +3449,167 @@ def configure_model(repo: Path, target: str, model: str, effort: str | None) -> 
     return apply_json_updates(repo, {CONFIG_PATH: config, SKILLS_LOCK_PATH: lock}, "model-set")
 
 
-def migrate_graph_contracts(repo: Path, apply: bool = False, full_diff: bool = False) -> dict[str, Any]:
-    """Add the missing review-artifact contracts to a graph written before this contract.
+NODE_MIGRATION_FIELDS = ("entry_condition", "inputs", "checks")
 
-    Only node ids that exist in the canonical kit graph are migrated, and only by copying
-    that graph's declaration.  A review node this tool does not ship is reported for an
-    explicit decision instead of being given a guessed artifact kind.
+
+def canonical_additions(canonical: list[Any], installed: list[Any]) -> tuple[list[Any], bool]:
+    """The canonical entries this list lacks, and whether the rest still matches.
+
+    The pre-migration shape of a list is not stored anywhere, so it is derived: what
+    the project has must be exactly the canonical list minus the additions, in the
+    canonical order.  An entry the project added itself is a customization, and the
+    caller refuses to rewrite it.
+    """
+    added = [item for item in canonical if item not in installed]
+    remainder = [item for item in canonical if item in installed]
+    return added, remainder == installed
+
+
+def plan_canonical_node_migration(workflow: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
+    """Add canonical nodes this graph lacks, by copying — or refuse and say why.
+
+    Adding a node is not an insertion: it rewires the edge that used to bypass it and
+    edits the neighbour that used to carry its work.  Both are the project's territory,
+    so both are compared with canon before anything is written, and a divergence on
+    either axis stops the migration for that node instead of overwriting a decision
+    somebody made on purpose.
+    """
+    installed_nodes = {
+        node["id"]: node for node in workflow.get("nodes", [])
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    canonical_nodes = {
+        node["id"]: node for node in template.get("nodes", [])
+        if isinstance(node, dict) and isinstance(node.get("id"), str)
+    }
+    installed_edges = [edge for edge in workflow.get("edges", []) if isinstance(edge, dict)]
+    canonical_edges = [edge for edge in template.get("edges", []) if isinstance(edge, dict)]
+    added: list[str] = []
+    divergences: list[str] = []
+    for node_id in [item for item in canonical_nodes if item not in installed_nodes]:
+        incoming = [edge for edge in canonical_edges if edge.get("to") == node_id]
+        outgoing = [edge for edge in canonical_edges if edge.get("from") == node_id]
+        if not incoming or not outgoing:
+            divergences.append(
+                f"{node_id}: канонический узел не имеет входящих или исходящих рёбер; "
+                "добавьте его вручную"
+            )
+            continue
+        successors = {edge.get("to") for edge in outgoing}
+        rewired: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        blocked = False
+        for edge in incoming:
+            matches = [
+                item for item in installed_edges
+                if item.get("from") == edge.get("from") and item.get("condition") == edge.get("condition")
+            ]
+            if len(matches) != 1:
+                divergences.append(
+                    f"{node_id}: ребро {edge.get('from')} --{edge.get('condition')}--> "
+                    f"в установленном графе {'отсутствует' if not matches else 'неоднозначно'}"
+                )
+                blocked = True
+                continue
+            old = matches[0]
+            if old.get("to") not in successors:
+                divergences.append(
+                    f"{node_id}: ребро {edge.get('from')} --{edge.get('condition')}--> "
+                    f"{old.get('to')} ведёт не в узел, который канон ставит после {node_id} "
+                    f"({', '.join(sorted(str(item) for item in successors))})"
+                )
+                blocked = True
+                continue
+            if old.get("max_retries") != edge.get("max_retries") or old.get("on_failure") != edge.get("on_failure"):
+                divergences.append(
+                    f"{node_id}: ребро {edge.get('from')} --{edge.get('condition')}--> {old.get('to')} "
+                    f"изменено (max_retries={old.get('max_retries')}, on_failure={old.get('on_failure')}); "
+                    "канон до миграции ожидает "
+                    f"max_retries={edge.get('max_retries')}, on_failure={edge.get('on_failure')}"
+                )
+                blocked = True
+                continue
+            rewired.append((old, edge))
+        if blocked:
+            continue
+        # The neighbour that stops doing this node's work: its own fields change, so it
+        # is compared against canon on exactly the fields the migration would touch.
+        updates: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        for old, edge in rewired:
+            successor_id = old["to"]
+            installed_successor = installed_nodes.get(successor_id)
+            canonical_successor = canonical_nodes.get(successor_id)
+            if not isinstance(installed_successor, dict) or not isinstance(canonical_successor, dict):
+                divergences.append(f"{node_id}: узел {successor_id} отсутствует в одном из графов")
+                blocked = True
+                continue
+            for field in set(installed_successor) | set(canonical_successor):
+                if field in NODE_MIGRATION_FIELDS:
+                    continue
+                if installed_successor.get(field) != canonical_successor.get(field):
+                    divergences.append(
+                        f"{node_id}: узел {successor_id} расходится с каноном в поле {field}"
+                    )
+                    blocked = True
+            expected_entry = old.get("condition")
+            if installed_successor.get("entry_condition") != expected_entry:
+                divergences.append(
+                    f"{node_id}: узел {successor_id} имеет entry_condition="
+                    f"{installed_successor.get('entry_condition')}; канон до миграции ожидает "
+                    f"{expected_entry}"
+                )
+                blocked = True
+            for field in ("inputs", "checks"):
+                canonical_list = canonical_successor.get(field)
+                installed_list = installed_successor.get(field)
+                if not isinstance(canonical_list, list) or not isinstance(installed_list, list):
+                    divergences.append(f"{node_id}: узел {successor_id} имеет некорректный {field}")
+                    blocked = True
+                    continue
+                _, intact = canonical_additions(canonical_list, installed_list)
+                if not intact:
+                    divergences.append(
+                        f"{node_id}: узел {successor_id} содержит собственные элементы {field}; "
+                        "миграция их не переписывает"
+                    )
+                    blocked = True
+            updates.append((installed_successor, canonical_successor, successor_id))
+        if blocked:
+            continue
+        insert_at = 0
+        for old, edge in rewired:
+            index = installed_edges.index(old)
+            installed_edges[index] = copy.deepcopy(edge)
+            insert_at = max(insert_at, index + 1)
+        for offset, edge in enumerate(outgoing):
+            installed_edges.insert(insert_at + offset, copy.deepcopy(edge))
+        for installed_successor, canonical_successor, _ in updates:
+            for field in NODE_MIGRATION_FIELDS:
+                installed_successor[field] = copy.deepcopy(canonical_successor.get(field))
+        order = list(workflow.get("nodes", []))
+        position = min(
+            (index for index, node in enumerate(order)
+             if isinstance(node, dict) and node.get("id") in successors),
+            default=len(order),
+        )
+        order.insert(position, copy.deepcopy(canonical_nodes[node_id]))
+        workflow["nodes"] = order
+        installed_nodes[node_id] = canonical_nodes[node_id]
+        added.append(node_id)
+    workflow["edges"] = installed_edges
+    return {"added": added, "divergences": divergences}
+
+
+def migrate_graph_contracts(repo: Path, apply: bool = False, full_diff: bool = False) -> dict[str, Any]:
+    """Bring a graph written before the current canon up to it, by copying only.
+
+    Two migrations share one command because a project runs one migration: the missing
+    review-artifact contracts, and the canonical nodes the graph does not have yet.
+    Either way nothing is invented — a node id or contract this tool does not ship is
+    reported for an explicit decision instead of being guessed.
     """
     workflow = load_json(repo / WORKFLOW_PATH)
     template = load_json(find_project_kit(repo) / "workflow.json")
+    node_migration = plan_canonical_node_migration(workflow, template)
     canonical = {
         node.get("id"): node.get("evidence_contract")
         for node in template.get("nodes", []) if isinstance(node, dict)
@@ -3479,36 +3631,50 @@ def migrate_graph_contracts(repo: Path, apply: bool = False, full_diff: bool = F
             migrated.append(str(node.get("id")))
         else:
             undecided.append(str(node.get("id")))
-    if not migrated:
-        return {
-            "status": "BLOCKED" if undecided else "NOT_APPLICABLE",
-            "migrated": [],
-            "requires_explicit_decision": undecided,
-            "note": (
+    added = node_migration["added"]
+    divergences = node_migration["divergences"]
+    if not migrated and not added:
+        blocked = bool(undecided or divergences)
+        note = "Граф уже соответствует канону"
+        if undecided:
+            note = (
                 "Для этих review-узлов нет канонического контракта: добавьте evidence_contract "
                 "в .agent-flow/workflow.json явно, указав имя из expected_evidence и вид артефакта "
                 + ", ".join(sorted(REVIEW_ARTIFACT_KINDS))
-                if undecided else "Граф уже объявляет обязательные артефакты review-узлов"
-            ),
+            )
+        elif divergences:
+            note = (
+                "Канонический узел не добавлен: затронутое ребро или соседний узел изменены "
+                "в этом проекте, и миграция их не переписывает. Добавьте узел вручную или "
+                "верните затронутые места к каноническому виду."
+            )
+        return {
+            "status": "BLOCKED" if blocked else "NOT_APPLICABLE",
+            "migrated": [],
+            "added_nodes": [],
+            "requires_explicit_decision": undecided + divergences,
+            "note": note,
         }
     errors, _ = validate_workflow(workflow, load_json(repo / CONFIG_PATH))
     if errors:
-        return {"status": "BLOCKED", "errors": errors, "migrated": migrated}
+        return {"status": "BLOCKED", "errors": errors, "migrated": migrated, "added_nodes": added}
     plan = one_file_plan(repo, WORKFLOW_PATH, json_bytes(workflow), "graph-migrate")
     if not apply:
         return {
             "status": "PARTIAL",
             "applied": False,
             "migrated": migrated,
-            "requires_explicit_decision": undecided,
+            "added_nodes": added,
+            "requires_explicit_decision": undecided + divergences,
             "plan": summarize_plan(repo, plan, full_diff=full_diff),
             "next_command": "devflow graph --migrate --apply",
         }
     result = apply_plan(repo, plan)
     result["migrated"] = migrated
-    result["requires_explicit_decision"] = undecided
+    result["added_nodes"] = added
+    result["requires_explicit_decision"] = undecided + divergences
     result["applied"] = True
-    if undecided:
+    if undecided or divergences:
         result["status"] = "PARTIAL"
     return result
 
