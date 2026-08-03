@@ -49,6 +49,22 @@
         "additionalProperties": false
       }
     },
+    "clients": {
+      "type": "object",
+      "description": "Optional extension of the engine client-adapter registry. The shipped kit carries no block.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "agents": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "project_skill_root": {"type": "string", "minLength": 1},
+          "personal_skill_root": {"type": "string", "minLength": 1},
+          "managed_instructions": {"type": "string", "minLength": 1},
+          "effort": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "models": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        },
+        "additionalProperties": false
+      }
+    },
     "models": {"type": "object"},
     "quality": {"type": "object"},
     "github": {"type": "object"},
