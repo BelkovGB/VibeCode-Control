@@ -1303,6 +1303,141 @@ class DevflowTestCase(unittest.TestCase):
         self.assertEqual(after["gaps"], [])
         self.assertEqual(after["local"]["github_remote_settings"], "verified")
 
+    # --- enforceable cycle budget --------------------------------------------------------
+
+    def record_cycle_attempt(self, node, issue="#21", status="FAIL", human_decision=None):
+        return devflow.record_run(
+            self.repo, node, status, "", issue, "PR-1", [f"{node} attempt"],
+            None, None, None, [], human_decision,
+        )
+
+    def cycle_traversals(self, node="quality_gates", issue="#21"):
+        _, workflow, _ = devflow.load_project_state(self.repo)
+        return devflow.cycle_budget(self.repo, workflow, node, issue)
+
+    def test_cycle_traversal_counts_re_entries_not_visits(self):
+        self.apply_init()
+        # Main path: each node on it is recorded once before any correction happens.
+        for node in ["quality_gates", "implementer_review", "final_review"]:
+            self.record_cycle_attempt(node)
+        self.assertEqual(self.cycle_traversals()["traversals"], 0)
+        # Correction 1 -> qg=2, ff=1, ir=2, fr=2
+        for node in ["fix_findings", "quality_gates", "implementer_review", "final_review"]:
+            self.record_cycle_attempt(node)
+        first = self.cycle_traversals()
+        self.assertEqual(first["counts"], {
+            "quality_gates": 2, "fix_findings": 1, "implementer_review": 2, "final_review": 2,
+        })
+        self.assertEqual(first["traversals"], 1)
+        self.assertEqual(first["remaining"], 1)
+        self.assertFalse(first["exhausted"])
+        # Correction 2 -> qg=3, ff=2, ir=3, fr=3
+        for node in ["fix_findings", "quality_gates", "implementer_review", "final_review"]:
+            self.record_cycle_attempt(node)
+        second = self.cycle_traversals()
+        self.assertEqual(second["traversals"], 2)
+        self.assertEqual(second["remaining"], 0)
+        self.assertTrue(second["exhausted"])
+
+    def test_last_legal_traversal_tail_is_still_recordable(self):
+        self.apply_init()
+        for node in ["quality_gates", "implementer_review", "final_review"]:
+            self.record_cycle_attempt(node)
+        for node in ["fix_findings", "quality_gates"]:
+            self.record_cycle_attempt(node)
+        # Second correction: the traversal count reaches its maximum at quality_gates,
+        # but the review tail of that same legal traversal must still be recordable.
+        self.record_cycle_attempt("fix_findings")
+        self.record_cycle_attempt("quality_gates")
+        self.assertTrue(self.cycle_traversals()["exhausted"])
+        for node in ["implementer_review", "final_review"]:
+            self.assertEqual(self.record_cycle_attempt(node)["status"], "PASS")
+
+    def test_record_beyond_the_per_node_cap_needs_a_human_decision(self):
+        self.apply_init()
+        for _ in range(3):
+            self.record_cycle_attempt("quality_gates")
+        with self.assertRaises(devflow.DevflowError) as context:
+            self.record_cycle_attempt("quality_gates")
+        message = str(context.exception)
+        self.assertIn("Бюджет цикла", message)
+        self.assertIn("Stall control", message)
+        self.assertIn("--human-decision", message)
+        self.assertIn("локальной истории", message)
+        recorded = self.record_cycle_attempt("quality_gates", human_decision="#21#issuecomment-1")
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertEqual(stored["human_decision"], "#21#issuecomment-1")
+        self.assertEqual(stored["issue_key"], "21")
+
+    def test_stop_statuses_do_not_consume_the_cycle_budget(self):
+        self.apply_init()
+        for _ in range(5):
+            self.record_cycle_attempt("quality_gates", status="BLOCKED")
+            self.record_cycle_attempt("quality_gates", status="HUMAN_NEEDED")
+        budget = self.cycle_traversals()
+        self.assertEqual(budget["counts"]["quality_gates"], 0)
+        self.assertEqual(budget["traversals"], 0)
+
+    def test_cycle_node_record_requires_an_issue_reference(self):
+        self.apply_init()
+        with self.assertRaises(devflow.DevflowError) as context:
+            devflow.record_run(
+                self.repo, "fix_findings", "FAIL", "", "", "PR-1", ["no issue"],
+                None, None, None,
+            )
+        self.assertIn("--issue", str(context.exception))
+        # A node outside any declared cycle keeps the previous contract.
+        self.assertEqual(
+            devflow.record_run(
+                self.repo, "inspect_project", "FAIL", "", "", "", ["outside any cycle"],
+                None, None, None,
+            )["status"],
+            "PASS",
+        )
+
+    def test_issue_key_groups_equivalent_references(self):
+        self.assertEqual(devflow.normalize_issue_key("#21"), "21")
+        self.assertEqual(devflow.normalize_issue_key(" 21 "), "21")
+        self.assertEqual(
+            devflow.normalize_issue_key("https://github.com/owner/repo/issues/21"), "21")
+        self.assertEqual(devflow.normalize_issue_key("TASK-ABC"), "task-abc")
+        self.assertEqual(devflow.normalize_issue_key(""), "")
+        self.apply_init()
+        self.record_cycle_attempt("quality_gates", issue="#21")
+        self.record_cycle_attempt("quality_gates", issue="https://github.com/owner/repo/issues/21")
+        self.assertEqual(self.cycle_traversals(issue="21")["counts"]["quality_gates"], 2)
+        self.assertEqual(self.cycle_traversals(issue="#99")["counts"]["quality_gates"], 0)
+
+    def test_operate_blocks_a_cycle_whose_budget_is_exhausted(self):
+        self.apply_init()
+        self.choose_executors(agent="codex", model=None, effort=None)
+        self.resolve_all_skill_decisions()
+        without_issue = devflow.operate_preflight(self.repo, "fix_findings")
+        self.assertTrue(any("--issue" in gap for gap in without_issue["external_gaps"]))
+        self.assertIsNone(without_issue["cycle_budget"])
+        for node in ["quality_gates", "fix_findings", "quality_gates", "fix_findings", "quality_gates"]:
+            self.record_cycle_attempt(node)
+        exhausted = devflow.operate_preflight(self.repo, "fix_findings", "#21")
+        self.assertEqual(exhausted["status"], "BLOCKED")
+        self.assertEqual(exhausted["cycle_budget"]["traversals"], 2)
+        self.assertEqual(exhausted["cycle_budget"]["remaining"], 0)
+        self.assertTrue(any("Бюджет цикла" in gap and "Stall control" in gap
+                            for gap in exhausted["external_gaps"]))
+
+    def test_max_fix_cycles_above_the_ceiling_requires_a_named_decision(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertEqual(config["policy"]["max_fix_cycles"], 2)
+        config["policy"]["max_fix_cycles"] = 5
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("max_fix_cycles_decision_ref" in item for item in errors))
+        config["policy"]["max_fix_cycles_decision_ref"] = "https://example.invalid/decisions/7"
+        errors, _ = devflow.validate_config(config)
+        self.assertEqual(errors, [])
+        config["policy"]["max_fix_cycles"] = 11
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("от 1 до 10" in item for item in errors))
+
     def test_github_runbook_is_linked_and_matches_the_reported_gaps(self):
         root = Path(devflow.__file__).resolve().parent.parent
         runbook = root / "references" / "github-preparation.md"

@@ -156,6 +156,20 @@ Stop after no more than two correction cycles without material progress. Present
 
 The PM decides. Continue only safe independent work while waiting; do not repeat the blocked approach indefinitely.
 
+These six points are the required format of the analysis when a cycle budget runs out. The CLI counts the traversals so the executor is no longer the only one counting.
+
+A traversal is a re-entry, not a visit. Nodes on the main path are recorded once before any correction happens, so the first record of each node in a declared cycle is free: for one cycle and one Issue, `traversals = max over the cycle's nodes of (records of that node − 1)`. Only `PASS`, `PARTIAL` and `FAIL` count; `BLOCKED` and `HUMAN_NEEDED` are stops and never consume the budget they report on.
+
+Enforcement has two layers. `devflow operate --node <node> --issue <ref>` reports the traversals and the remainder, and turns `BLOCKED` once the budget is spent, so another traversal never starts. `devflow run record` keeps a per-node cap as a backstop: a record of a node already stored `max_traversals + 1` times is refused. The cap is per node rather than global on purpose — the review tail of the last legal traversal is written after the traversal count has already reached its maximum, and must remain recordable.
+
+Extending a spent budget is possible only through `devflow run record --human-decision <ref>`, a non-empty reference to the PM decision that is stored in the run record. There is no silent extension.
+
+Every record of a node inside a declared cycle requires `--issue`, for every status: a stop that is not attributed to an Issue is as useless as an attempt that is not.
+
+The budget is counted from the local run-record history of this checkout. `.agent-flow/.local/` is not committed, so a background runner on a fresh checkout starts from an empty history. This layer is a backstop; counting across machines is the coordinator's responsibility, and it must pass the same `--issue`.
+
+Edge retries — `max_retries` on an edge outside `allowed_cycles`, such as the one on `tdd_red` — are a separate executor-side mechanism and are not covered by this budget.
+
 ## Limits
 
 Track observed rate, review, context, tool, or runner limit signals. Consolidate independent checks and avoid unnecessary repeated reads. Warn when the selected order may exhaust an observable resource.
