@@ -4441,10 +4441,10 @@ def operate_preflight(repo: Path, node_id: str, issue: str = "", human_decision:
         test_spec = {"required_because": "cross-model-routing", **routing}
         if not reference:
             external_blockers.append(
-                f"Узел {node_id} исполняется моделью {routing['node_model']}, а роль "
-                f"{routing['role']} — моделью {routing['role_model']}: тесты пишет не тот контекст, "
-                "который их проектировал, поэтому нужна спека. Запишите её артефактом узла design "
-                "для этой задачи: `run record --node design ... --evidence 'test spec=<ref>'`"
+                f"Узел {node_id} исполняется моделью {routing['node_model']}, а "
+                f"{routing['role_description']}: тот же ли это контекст, который проектировал "
+                "тесты, здесь не доказать, поэтому нужна спека. Запишите её артефактом узла "
+                "design для этой задачи: `run record --node design ... --evidence 'test spec=<ref>'`"
             )
         else:
             verdict = test_spec_verdict(repo, reference)
@@ -5578,10 +5578,25 @@ def cross_model_routing(node: dict[str, Any], config: Any) -> dict[str, Any] | N
     role_entry, _ = parse_profile_value(
         role.get("model") if isinstance(role, dict) else None, "roles.model"
     )
-    if role_entry.get("mode") != MODE_EXPLICIT or role_entry.get("value") == model.get("value"):
+    role_mode = role_entry.get("mode")
+    if role_mode == MODE_EXPLICIT and role_entry.get("value") == model.get("value"):
+        # The only provable "same model, same context": both levels pinned and equal.
         return None
-    return {"node_model": model.get("value"), "role_model": role_entry.get("value"),
-            "role": node.get("role")}
+    if role_mode == MODE_EXPLICIT:
+        description = f"роль {node.get('role')} — моделью {role_entry.get('value')}"
+    else:
+        # An `inherited` role resolves at run time, so whether it is the same context is
+        # undecidable here — and undecidable demands the contract instead of waiving it.
+        description = (
+            f"модель роли {node.get('role')} не определена до запуска (mode={role_mode})"
+        )
+    return {
+        "node_model": model.get("value"),
+        "role_model": role_entry.get("value") if role_mode == MODE_EXPLICIT else None,
+        "role_mode": role_mode,
+        "role": node.get("role"),
+        "role_description": description,
+    }
 
 
 def test_spec_evidence(repo: Path, issue: str) -> str | None:

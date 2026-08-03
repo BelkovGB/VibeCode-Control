@@ -197,7 +197,9 @@ devflow model set tdd_red <model> --effort <level>
 devflow config effective --format table
 ```
 
-That difference has a consequence, and the CLI enforces it. When `tdd_red` runs on a different model than the `implementer` role, the tests are written by a context that did not design them, so the specification becomes the contract between the two: `devflow operate --node tdd_red --issue <ref>` is `BLOCKED` until the `design` node has recorded a `test spec` reference for that Issue. When both levels resolve to the same model there is no second context and no contract to demand — the requirement never becomes a permanent gap for projects that do not route.
+That difference has a consequence, and the CLI enforces it. Routing means the node's model is pinned by an override and it is not provably the role's model: `devflow operate --node tdd_red --issue <ref>` is then `BLOCKED` until the `design` node has recorded a `test spec` reference for that Issue, because the tests would be written by a context that may not be the one that designed them.
+
+"Same model, same context" is only provable when both levels are pinned and equal — that is the single case where no contract is demanded, so a project that does not route never acquires a permanent gap. A role left `inherited` resolves at run time and cannot be compared here, so pinning a node against an inherited role counts as routing and requires the specification. That is the ordinary single-client shape — the role takes whatever strong model the client resolves, one node is pinned to another — and treating an undecidable comparison as "probably the same" would waive the contract exactly where it matters most.
 
 The reference is checked as far as it can be. If it resolves to a file in this repository, preflight runs the specification check itself and reports the verdict, so "the reference exists and the specification is garbage" cannot pass; if it points outside, preflight says in words that the content is not locally verifiable and neither blocks nor claims a pass.
 

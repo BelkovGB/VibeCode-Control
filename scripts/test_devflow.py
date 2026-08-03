@@ -2660,6 +2660,49 @@ class DevflowTestCase(unittest.TestCase):
         config["node_overrides"]["tdd_red"]["model"] = {"mode": "explicit", "value": "verified-model"}
         self.assertIsNone(devflow.cross_model_routing(node, config))
 
+    def test_an_inherited_role_with_a_pinned_node_is_routing(self):
+        """The primary shape: the client resolves the role, the node is pinned."""
+        self.apply_init()
+        self.choose_executors(agent="claude-code", model=None, effort="high")
+        self.resolve_all_skill_decisions()
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        self.assertEqual(config["roles"]["implementer"]["model"], {"mode": "inherited"})
+        config["node_overrides"] = {
+            "tdd_red": {"model": {"mode": "explicit", "value": "writer-model"}},
+        }
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        routing = devflow.cross_model_routing(
+            node, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertIsNotNone(routing)
+        self.assertEqual(routing["role_mode"], "inherited")
+        self.assertIsNone(routing["role_model"])
+        report = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertEqual(report["status"], "BLOCKED")
+        # The blocker names the mode instead of pretending the role has a value.
+        blocker = next(gap for gap in report["external_gaps"] if "tdd_red" in gap)
+        self.assertIn("mode=inherited", blocker)
+        self.assertIn("не определена до запуска", blocker)
+
+    def test_an_unresolvable_role_model_never_waives_the_contract(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code", model=None, effort=None)
+        _, workflow, _ = devflow.load_project_state(self.repo)
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        for role_model in ({"mode": "inherited"}, {"mode": "unset"}):
+            config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+            config["roles"]["implementer"]["model"] = role_model
+            config["node_overrides"] = {
+                "tdd_red": {"model": {"mode": "explicit", "value": "writer-model"}},
+            }
+            routing = devflow.cross_model_routing(node, config)
+            self.assertIsNotNone(routing, role_model)
+            self.assertEqual(routing["role_mode"], role_model["mode"])
+        # An override that is itself not pinned is not routing: there is no second model.
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["node_overrides"] = {"tdd_red": {"model": {"mode": "inherited"}}}
+        self.assertIsNone(devflow.cross_model_routing(node, config))
+
     def test_routing_to_another_model_requires_the_spec_and_checks_it_when_local(self):
         self.apply_init()
         self.prepare_verified_delivery_state(agent="claude-code")
@@ -2667,7 +2710,7 @@ class DevflowTestCase(unittest.TestCase):
         blocked = devflow.operate_preflight(self.repo, "tdd_red", "#6")
         self.assertEqual(blocked["status"], "BLOCKED")
         self.assertEqual(blocked["test_spec"]["required_because"], "cross-model-routing")
-        self.assertTrue(any("тесты пишет не тот контекст" in gap
+        self.assertTrue(any("тот же ли это контекст" in gap
                             for gap in blocked["external_gaps"]))
         # A local reference is checked for free, so a broken spec cannot hide behind it.
         (self.repo / "docs").mkdir(exist_ok=True)
