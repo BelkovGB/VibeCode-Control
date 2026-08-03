@@ -38,6 +38,14 @@ WORKFLOW_PATH = f"{META_DIR}/workflow.json"
 SKILLS_LOCK_PATH = f"{META_DIR}/skills.lock.json"
 SETUP_STATE_PATH = f"{META_DIR}/setup-state.json"
 SETUP_STAGES_PATH = f"{META_DIR}/setup-stages.json"
+# The stages this engine evaluates.  An installed project keeps its own
+# `setup-stages.json`, so a newer CLI meets definitions that predate a stage it
+# knows about; the sequence below is what the evaluation itself emits and is the
+# reference for detecting those stale definitions.
+SETUP_STAGE_SEQUENCE = (
+    "inspection", "context", "roles", "workspaces", "graph", "documentation",
+    "git-github", "quality", "skills", "automation", "pilot",
+)
 MANAGED_START = "<!-- devflow:managed:start -->"
 MANAGED_END = "<!-- devflow:managed:end -->"
 GITIGNORE_START = "# devflow:managed:start"
@@ -2921,12 +2929,24 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
     stage_ids = [stage["id"] for stage in stages_def["stages"]]
     next_for = {stage_ids[index]: stage_ids[index + 1] if index + 1 < len(stage_ids) else None for index in range(len(stage_ids))}
     command_for = {stage["id"]: stage.get("next_command") for stage in stages_def["stages"]}
+    # Definitions installed before this CLI knew a stage must not kill the two
+    # commands that are supposed to name the migration.  Every stage this engine
+    # emits is still reported; a stage the installed file does not declare is
+    # linked to the next stage it does declare and marked stale below.
+    stale_stages = [stage for stage in SETUP_STAGE_SEQUENCE if stage not in next_for]
+
+    def following(stage: str) -> str | None:
+        if stage in next_for:
+            return next_for[stage]
+        remaining = SETUP_STAGE_SEQUENCE[SETUP_STAGE_SEQUENCE.index(stage) + 1:]
+        return next((candidate for candidate in remaining if candidate in next_for), None)
+
     inspection = inspect_repository(repo)
     results: list[dict[str, Any]] = []
     results.append(stage_result(
         "inspection", "PASS",
         [f"Read-only inspection completed; {inspection['project']['file_count']} files; mode {inspection['project']['recommended_mode']}"],
-        [], "Proceed with the detected init/adopt mode.", next_for["inspection"], command_for["inspection"]
+        [], "Proceed with the detected init/adopt mode.", following("inspection"), command_for.get("inspection")
     ))
     if not (repo / CONFIG_PATH).is_file() or not (repo / WORKFLOW_PATH).is_file() or not (repo / SKILLS_LOCK_PATH).is_file():
         mode = inspection["project"]["recommended_mode"]
@@ -2974,7 +2994,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
     results.append(stage_result(
         "context", context_status, context_evidence, context_gaps,
         "Record the current product stage and the explicit PM decision; do not infer approval.",
-        next_for["context"], "devflow config set project.product_stage <stage>", bool(context_gaps)
+        following("context"), "devflow config set project.product_stage <stage>", bool(context_gaps)
     ))
 
     # An undecided parameter blocks this stage through an explicit typed marker, not
@@ -2990,7 +3010,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
             f"{item['pointer']}: {item['decision']} — `{item['command']}`" for item in pending
         ],
         "Verify concrete agents, models, effort, and permissions for the next runs; never use silent fallback.",
-        next_for["roles"],
+        following("roles"),
         pending[0]["command"] if pending else "devflow config effective",
         bool(pending),
     ))
@@ -3006,8 +3026,8 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         workspace_gaps,
         "Зафиксируйте, где живёт управляющий слой, где идёт работа по Issue и где хранится временное, "
         "и что разрешено в каждом каталоге.",
-        next_for["workspaces"],
-        workspaces["pending"][0]["command"] if workspaces["pending"] else command_for["workspaces"],
+        following("workspaces"),
+        workspaces["pending"][0]["command"] if workspaces["pending"] else command_for.get("workspaces"),
         bool(workspaces["pending"]),
     ))
 
@@ -3017,7 +3037,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         [f"Nodes: {len(workflow.get('nodes', []))}; edges: {len(workflow.get('edges', []))}"],
         graph_errors + graph_warnings,
         "Fix unreachable nodes, unbounded retries, unknown roles, or an unsafe merge path before automation.",
-        next_for["graph"], "devflow graph --format table", False
+        following("graph"), "devflow graph --format table", False
     ))
 
     docs = inspection["documentation"]
@@ -3032,7 +3052,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         [f"README={docs['readme'] or 'missing'}", f"architecture={docs['architecture'] or 'missing'}", f"ADRs={docs['adrs']}"],
         doc_gaps,
         "Create or repair canonical documents from verified project facts; update architecture docs in the same PR as architectural changes.",
-        next_for["documentation"], "devflow audit docs", False
+        following("documentation"), "devflow audit docs", False
     ))
 
     git_info = inspection["git"]
@@ -3049,7 +3069,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         [f"branch={git_info['branch']}", f"dirty={git_info['dirty']}", f"remotes={len(git_info['remotes'])}"],
         git_gaps,
         "Audit local Git and remote GitHub separately. Do not claim remote protection without API evidence. Follow references/github-preparation.md step by step.",
-        next_for["git-github"], "devflow audit git", False
+        following("git-github"), "devflow audit git", False
     ))
 
     quality = config.get("quality", {})
@@ -3067,7 +3087,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         [f"test files={inspection['quality']['test_files']}", f"CI workflows={len(inspection['quality']['ci_workflows'])}"],
         quality_gaps,
         "Measure the existing baseline before setting thresholds; use risk-based tests and evidence bound to head SHA.",
-        next_for["quality"], "devflow audit quality", False
+        following("quality"), "devflow audit quality", False
     ))
 
     skill_report = skills_audit(repo)
@@ -3076,7 +3096,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         [f"Locked skills: {len(lock.get('skills', []))}", f"Node decisions: {len(lock.get('node_decisions', {}))}"],
         skill_report["errors"] + skill_report["warnings"],
         "Review one matrix for all nodes; explicitly accept assigned skills or zero-skill. Search only allowlisted sources.",
-        next_for["skills"], "devflow skills recommend", bool(skill_report["errors"])
+        following("skills"), "devflow skills recommend", bool(skill_report["errors"])
     ))
 
     automation_gaps = []
@@ -3093,7 +3113,7 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
         [f"core background skills present={all(path.is_file() for path in core_skills)}"],
         automation_gaps,
         "Verify runner checkout, explicit node prompt, model/effort inputs, permissions, required checks, and state-change notifications.",
-        next_for["automation"], "devflow doctor --deep", False
+        following("automation"), "devflow doctor --deep", False
     ))
 
     pilot = manual.get("pilot", {})
@@ -3107,6 +3127,13 @@ def evaluate_setup(repo: Path) -> list[dict[str, Any]]:
     ))
 
     for result in results:
+        if result["stage"] in stale_stages:
+            result["gaps"].append(
+                f"Определения этапов устарели (нет {result['stage']}): выполните `devflow upgrade --apply`"
+            )
+            result["next_command"] = "devflow upgrade"
+            if result["status"] == "PASS":
+                result["status"] = "PARTIAL"
         override = manual.get(result["stage"])
         if isinstance(override, dict):
             evidence = override.get("evidence", [])

@@ -1560,6 +1560,49 @@ class DevflowTestCase(unittest.TestCase):
         report = devflow.workspace_report(self.repo, devflow.load_json(self.repo / devflow.CONFIG_PATH))
         self.assertTrue(any("не игнорируется git" in item for item in report["findings"]))
 
+    def downgrade_stage_definitions(self):
+        """Reproduce a project installed before this stage existed."""
+        stages = devflow.load_json(self.repo / devflow.SETUP_STAGES_PATH)
+        stages["stages"] = [item for item in stages["stages"] if item["id"] != "workspaces"]
+        (self.repo / devflow.SETUP_STAGES_PATH).write_text(
+            json.dumps(stages, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def test_setup_survives_stage_definitions_older_than_the_cli(self):
+        self.apply_init()
+        self.downgrade_stage_definitions()
+        results = devflow.evaluate_setup(self.repo)
+        self.assertEqual([item["stage"] for item in results], list(devflow.SETUP_STAGE_SEQUENCE))
+        stage = next(item for item in results if item["stage"] == "workspaces")
+        self.assertEqual(stage["status"], "PARTIAL")
+        self.assertTrue(any("устарели" in gap and "upgrade --apply" in gap for gap in stage["gaps"]))
+        self.assertIn("upgrade", stage["next_command"])
+        self.assertEqual(stage["next_stage"], "graph")
+        self.assertEqual(
+            next(item for item in results if item["stage"] == "roles")["next_stage"], "graph")
+
+    def test_doctor_survives_stage_definitions_older_than_the_cli(self):
+        self.apply_init()
+        self.downgrade_stage_definitions()
+        report = devflow.doctor(self.repo)
+        setup = next(item for item in report["diagnosis"] if item["check"] == "setup")
+        stage = next(item for item in setup["stages"] if item["stage"] == "workspaces")
+        self.assertEqual(stage["status"], "PARTIAL")
+        self.assertTrue(any("устарели" in gap for gap in stage["gaps"]))
+
+    def test_upgrade_refreshes_stage_definitions_and_activates_the_stage(self):
+        self.apply_init()
+        self.downgrade_stage_definitions()
+        plan = devflow.build_setup_plan(self.repo, "upgrade", "test-upgrade")
+        self.assertIn(devflow.SETUP_STAGES_PATH, [item["path"] for item in plan["operations"]])
+        devflow.apply_plan(self.repo, plan)
+        installed = devflow.load_json(self.repo / devflow.SETUP_STAGES_PATH)
+        self.assertIn("workspaces", [item["id"] for item in installed["stages"]])
+        stage = next(item for item in devflow.evaluate_setup(self.repo)
+                     if item["stage"] == "workspaces")
+        self.assertFalse(any("устарели" in gap for gap in stage["gaps"]))
+        for role in devflow.WORKSPACE_ROLES:
+            self.assertTrue(any(role in gap for gap in stage["gaps"]), role)
+
     def test_decided_workspaces_pass_the_stage(self):
         self.apply_init()
         (self.repo.parent / "work").mkdir(exist_ok=True)
