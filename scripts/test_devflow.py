@@ -1489,6 +1489,197 @@ class DevflowTestCase(unittest.TestCase):
         errors, _ = devflow.validate_config(config)
         self.assertTrue(any("от 1 до 10" in item for item in errors))
 
+    # --- gate origin and the minimal validation plan --------------------------------------
+
+    def declare_validation_plan(self, skip=("test fails for intended reason",)):
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["quality"]["validation_plan"] = {
+            "docs-only": {
+                "paths": ["docs/", "*.md", ".agent-flow/"],
+                "skip_checks": list(skip),
+                "reason": "изменение не затрагивает исполняемый код",
+            }
+        }
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        return config
+
+    def commit_on_branch(self, relative, content, message):
+        target = self.repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return self.commit_worktree(message)
+
+    def prepare_branch_with_base(self):
+        self.apply_init()
+        self.choose_executors(agent="codex", model=None, effort=None)
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "-B", "main"], check=True)
+        self.commit_worktree("baseline")
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "-b", "agent/change"], check=True)
+
+    def test_every_gate_carries_a_known_origin_and_scope(self):
+        self.apply_init()
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        config["github"]["required_checks"] = ["unit"]
+        node = next(item for item in workflow["nodes"] if item["id"] == "final_review")
+        verdict = {"claim": None, "minimization": False}
+        gates = devflow.gate_attribution(config, workflow, node, verdict)
+        self.assertTrue(gates)
+        for gate in gates:
+            self.assertIn(gate["origin"], devflow.GATE_ORIGINS)
+            self.assertEqual(gate["scope"], devflow.GATE_SCOPE_REPOSITORY)
+            self.assertTrue(gate["reason"])
+            self.assertIn(gate["requirement"], {
+                devflow.GATE_REQUIRED_PROVEN,
+                devflow.GATE_NOT_REQUIRED,
+                devflow.GATE_REQUIRED_UNPROVEN,
+            })
+        origins = {gate["origin"] for gate in gates}
+        self.assertIn("repository-policy", origins)
+        self.assertIn("skill", origins)
+        kinds = {gate["kind"] for gate in gates}
+        self.assertIn("evidence-artifact", kinds)
+
+    def test_unknown_gate_origin_is_an_error(self):
+        self.assertNotIn("invented", devflow.GATE_ORIGINS)
+
+    def test_verified_change_type_minimizes_only_node_checks(self):
+        self.prepare_branch_with_base()
+        self.declare_validation_plan()
+        self.commit_on_branch("docs/guide.md", "# guide\n", "docs change")
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        verdict = devflow.verify_change_type(self.repo, config, "docs-only")
+        self.assertTrue(verdict["verified"])
+        self.assertTrue(verdict["minimization"])
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        gates = devflow.gate_attribution(config, workflow, node, verdict)
+        excluded = [g for g in gates if g["requirement"] == devflow.GATE_NOT_REQUIRED]
+        self.assertTrue(excluded)
+        for gate in excluded:
+            self.assertEqual(gate["origin"], "skill")
+            self.assertEqual(gate["kind"], devflow.GATE_KIND_NODE_CHECK)
+            self.assertIn("docs-only", gate["reason"])
+
+    def test_a_claim_the_diff_does_not_support_grants_nothing(self):
+        self.prepare_branch_with_base()
+        self.declare_validation_plan()
+        self.commit_on_branch("app.py", "print(2)\n", "code change")
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        verdict = devflow.verify_change_type(self.repo, config, "docs-only")
+        self.assertFalse(verdict["verified"])
+        self.assertFalse(verdict["minimization"])
+        self.assertIn("app.py", verdict["unmatched_paths"])
+        self.assertIn("не подтверждён диффом", verdict["note"])
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        gates = devflow.gate_attribution(config, workflow, node, verdict)
+        self.assertEqual(
+            [g for g in gates if g["requirement"] == devflow.GATE_NOT_REQUIRED], [])
+
+    def test_an_undeclared_type_or_missing_policy_falls_back_loudly(self):
+        self.prepare_branch_with_base()
+        self.commit_on_branch("docs/guide.md", "# guide\n", "docs change")
+        config, _, _ = devflow.load_project_state(self.repo)
+        self.assertTrue(devflow.changed_paths_for_validation(self.repo)["paths"])
+        without_policy = devflow.verify_change_type(self.repo, config, "docs-only")
+        self.assertFalse(without_policy["minimization"])
+        self.assertIn("не настроена", without_policy["note"])
+        self.declare_validation_plan()
+        config, _, _ = devflow.load_project_state(self.repo)
+        unknown_type = devflow.verify_change_type(self.repo, config, "refactor")
+        self.assertFalse(unknown_type["minimization"])
+        self.assertIn("не объявлен", unknown_type["note"])
+        undeclared = devflow.verify_change_type(self.repo, config, "")
+        self.assertFalse(undeclared["minimization"])
+        self.assertIn("не объявлен", undeclared["note"])
+
+    def test_minimization_is_unavailable_without_a_comparable_base(self):
+        self.apply_init()
+        self.choose_executors(agent="codex", model=None, effort=None)
+        self.declare_validation_plan()
+        self.commit_worktree("single commit")
+        # No branch a comparison could use: no remote, and no main or master.
+        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "-b", "agent/only"], check=True)
+        for branch in ["main", "master"]:
+            subprocess.run(["git", "-C", str(self.repo), "branch", "-q", "-D", branch],
+                           check=False, capture_output=True)
+        (self.repo / "docs").mkdir(exist_ok=True)
+        self.commit_on_branch("docs/guide.md", "# guide\n", "docs change")
+        config, _, _ = devflow.load_project_state(self.repo)
+        verdict = devflow.verify_change_type(self.repo, config, "docs-only")
+        self.assertFalse(verdict["minimization"])
+        self.assertIn("Базовая версия", verdict["note"])
+
+    def test_policy_cannot_lower_a_repository_or_merge_gate_requirement(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["github"]["required_checks"] = ["unit"]
+        config["quality"]["validation_plan"] = {
+            "docs-only": {
+                "paths": ["docs/"],
+                "reason": "r",
+                "skip_checks": ["required_checks_green", "unit"],
+            }
+        }
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any("инвариант merge gate" in item for item in errors))
+        self.assertTrue(any("политикой репозитория" in item for item in errors))
+
+    def test_policy_cannot_drop_a_required_evidence_artifact(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        workflow = devflow.load_json(kit / "workflow.json")
+        config["quality"]["validation_plan"] = {
+            "docs-only": {
+                "paths": ["docs/"],
+                "reason": "r",
+                "skip_checks": ["review verdict bound to head SHA"],
+            }
+        }
+        errors, _ = devflow.validate_workflow(workflow, config)
+        self.assertTrue(any(
+            "обязательный артефакт узла final_review" in item for item in errors))
+
+    def test_validation_plan_requires_paths_and_a_reason(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        config["quality"]["validation_plan"] = {"docs-only": {"skip_checks": ["unit"]}}
+        errors, _ = devflow.validate_config(config)
+        self.assertTrue(any(".paths обязателен" in item for item in errors))
+        self.assertTrue(any(".reason обязателен" in item for item in errors))
+
+    def test_kit_ships_no_validation_plan_so_nothing_is_minimized(self):
+        kit = devflow.find_project_kit(self.repo)
+        config = devflow.load_json(kit / "config.json")
+        self.assertNotIn("validation_plan", config["quality"])
+        self.assertEqual(devflow.validation_plan_of(config), {})
+
+    def test_three_requirement_states_never_collapse_in_a_run_record(self):
+        self.prepare_branch_with_base()
+        self.declare_validation_plan()
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["github"]["required_checks"] = ["unit"]
+        config["models"] = {"availability_checked_at": "2026-01-01T00:00:00Z", "available": ["m"]}
+        config["automation"]["background_workers"] = "verified"
+        config["github"].update({"remote_settings": "verified", "ruleset_verified": True})
+        for settings in config["roles"].values():
+            if settings["agent"] != "human":
+                settings["model"] = {"mode": "explicit", "value": "m"}
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        self.resolve_all_skill_decisions()
+        head = self.commit_on_branch("docs/guide.md", "# guide\n", "docs change")
+        recorded = devflow.record_run(
+            self.repo, "tdd_red", "PASS", head, "#14", "PR-1",
+            ["failing test before implementation=ci://run/1", "failure reason=assert"],
+            "codex", "m", "high", ["unit=success"], None, "docs-only",
+        )
+        stored = devflow.load_json(Path(recorded["path"]))
+        self.assertTrue(stored["validation"]["verified"])
+        states = {gate["name"]: gate["requirement"] for gate in stored["gates"]}
+        self.assertEqual(states["unit"], devflow.GATE_REQUIRED_PROVEN)
+        self.assertEqual(
+            states["test fails for intended reason"], devflow.GATE_NOT_REQUIRED)
+        self.assertIn(devflow.GATE_REQUIRED_UNPROVEN, set(states.values()))
+        self.assertEqual(len(set(states.values())), 3)
+
     # --- client adapters -----------------------------------------------------------------
 
     def test_unknown_agent_reference_blocks_validation_with_its_pointer(self):

@@ -92,6 +92,14 @@ Use characterization tests when old behavior is not safely specified. Select uni
 
 Keep fixtures, seed data, and environments reproducible. Do not use retries to conceal flaky or real failures. Never weaken existing tests, linters, type checks, security rules, thresholds, CI, or workflow rules to make a PR green.
 
+Every required gate states where it came from. `repository-policy` is what the repository itself demands — the checks in `github.required_checks` and the merge-gate invariants. `skill` is what the graph and its skills demand — a node's `checks` and the artifacts of its `evidence_contract`. `risk-escalation` is what the risk class added. An unknown origin is an error. Each gate also carries a `scope`, today always `repository`, and a `reason`.
+
+A small change may run a smaller set of checks, but only where the repository's policy allows it. Declare the change type with `--change-type`; the CLI verifies the declaration against the actual diff and grants the minimal plan only when every changed path belongs to that type. A claim the diff does not support grants nothing and says which paths fell outside it. Without a comparable base, with no visible change at all, with no `quality.validation_plan`, or with a type the policy does not declare, the full set applies and the reason is stated rather than left silent.
+
+Minimization covers what to run, never what to trust. Only `skill`-origin node checks and the extent of the quality commands can be reduced. The merge-gate invariants, the artifacts of an `evidence_contract`, the cycle and chain budgets, and the reinforced review of guarded files are never removable — by any change type and by any owner policy. A `validation_plan` that names one of them in `skip_checks` is a configuration error.
+
+A run record keeps the three states apart and never collapses them: `required-and-proven`, `not-required-for-this-change` with the change type and the reason it was excluded, and `required-and-unproven`, which blocks. A reader a year later must be able to tell a gate that did not apply from a gate that was skipped.
+
 Map every acceptance criterion to a check, observed result, and durable artifact. Bind evidence to the current head SHA. A new commit invalidates prior approval and any result that no longer corresponds to the code.
 
 Record the outcome with `devflow run record`. A delivery `PASS` requires named evidence: every entry of the node's `expected_evidence` written as `<name>=<reference>`, and every artifact the node's `evidence_contract` marks as required written as `<name>=<kind>:<reference>`, so the kind is proven instead of assumed.
