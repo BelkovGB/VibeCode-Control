@@ -2558,6 +2558,209 @@ class DevflowTestCase(unittest.TestCase):
         devflow.apply_plan(self.repo, devflow.build_setup_plan(self.repo, "upgrade", "test-upgrade"))
         self.assertTrue((self.repo / devflow.SESSION_ASSIGNMENT_TEMPLATE).is_file())
 
+    # --- test spec and model routing ---------------------------------------------------
+
+    SPEC = "\n".join([
+        "# Test specification",
+        "## Criteria",
+        "- `FR-001` — the parser rejects an unknown field",
+        "## Cases",
+        "### CASE-001",
+        "- Criterion: `FR-001`",
+        "- Type: `unit`",
+        "- Given: a config with an unknown field",
+        "- When: it is validated",
+        "- Then: the error names the field",
+        "- Expected failure reason: no validation exists yet",
+        "",
+    ])
+
+    def route_tdd_red_to_another_model(self, model="fast-model"):
+        config, _, _ = devflow.load_project_state(self.repo)
+        config["models"]["available"] = sorted(set(config["models"]["available"]) | {model})
+        config["node_overrides"] = {
+            "tdd_red": {"model": {"mode": "explicit", "value": model}},
+        }
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        return config
+
+    def record_design_spec(self, reference, issue="#6"):
+        return devflow.record_run(
+            self.repo, "design", "PASS", "", issue, "",
+            [f"design decision=ADR-1", f"test spec={reference}", "issue draft=#6"],
+            "claude-code", "verified-model", "high",
+        )
+
+    def test_shipped_spec_template_passes_its_own_checker(self):
+        kit = devflow.find_project_kit(self.repo)
+        report = devflow.check_test_spec((kit / "managed" / "test-spec.md").read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["covered"], report["criteria"])
+        self.apply_init()
+        self.assertTrue((self.repo / devflow.TEST_SPEC_TEMPLATE).is_file())
+
+    def test_spec_check_requires_the_triple_the_reason_and_the_type(self):
+        broken = "\n".join([
+            "## Criteria",
+            "- `FR-001` — something",
+            "## Cases",
+            "### CASE-001",
+            "- Criterion: `FR-001`",
+            "- Type: `smoke`",
+            "- Given: a state",
+            "- When: an action",
+            "",
+        ])
+        report = devflow.check_test_spec(broken)
+        self.assertEqual(report["status"], "BLOCKED")
+        self.assertTrue(any("Then обязательно" in item for item in report["errors"]))
+        self.assertTrue(any("ожидаемая причина падения" in item for item in report["errors"]))
+        self.assertTrue(any("тип теста" in item for item in report["errors"]))
+
+    def test_spec_check_verifies_the_link_in_both_directions(self):
+        uncovered = self.SPEC + "\n".join([
+            "- `SC-001` — the second criterion nobody covers",
+            "",
+        ])
+        # The extra criterion is declared after the cases section, so re-declare cleanly.
+        uncovered = self.SPEC.replace(
+            "- `FR-001` — the parser rejects an unknown field",
+            "- `FR-001` — the parser rejects an unknown field\n- `SC-001` — nobody covers this",
+        )
+        report = devflow.check_test_spec(uncovered)
+        self.assertEqual(report["status"], "BLOCKED")
+        self.assertTrue(any("SC-001 не покрыт" in item for item in report["errors"]))
+        dangling = self.SPEC.replace("- Criterion: `FR-001`", "- Criterion: `FR-777`")
+        report = devflow.check_test_spec(dangling)
+        self.assertTrue(any("FR-777 не объявлен" in item for item in report["errors"]))
+        duplicate = self.SPEC.replace(
+            "- `FR-001` — the parser rejects an unknown field",
+            "- `FR-001` — one\n- `FR-001` — two",
+        )
+        self.assertTrue(any("объявлен дважды" in item
+                            for item in devflow.check_test_spec(duplicate)["errors"]))
+
+    def test_spec_check_states_what_it_does_not_verify(self):
+        report = devflow.check_test_spec(self.SPEC)
+        self.assertEqual(report["status"], "PASS")
+        self.assertIn("ревьюер", report["not_verified"])
+
+    def test_routing_to_another_model_is_detected_from_the_configuration(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(agent="claude-code")
+        _, workflow, _ = devflow.load_project_state(self.repo)
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        self.assertIsNone(devflow.cross_model_routing(node, config))
+        config = self.route_tdd_red_to_another_model()
+        routing = devflow.cross_model_routing(node, config)
+        self.assertEqual(routing["node_model"], "fast-model")
+        self.assertEqual(routing["role_model"], "verified-model")
+        # The same model on both levels is not routing, whichever way it was written.
+        config["node_overrides"]["tdd_red"]["model"] = {"mode": "explicit", "value": "verified-model"}
+        self.assertIsNone(devflow.cross_model_routing(node, config))
+
+    def test_an_inherited_role_with_a_pinned_node_is_routing(self):
+        """The primary shape: the client resolves the role, the node is pinned."""
+        self.apply_init()
+        self.choose_executors(agent="claude-code", model=None, effort="high")
+        self.resolve_all_skill_decisions()
+        config, workflow, _ = devflow.load_project_state(self.repo)
+        self.assertEqual(config["roles"]["implementer"]["model"], {"mode": "inherited"})
+        config["node_overrides"] = {
+            "tdd_red": {"model": {"mode": "explicit", "value": "writer-model"}},
+        }
+        devflow.write_project_json(self.repo, devflow.CONFIG_PATH, config, "config-set")
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        routing = devflow.cross_model_routing(
+            node, devflow.load_json(self.repo / devflow.CONFIG_PATH))
+        self.assertIsNotNone(routing)
+        self.assertEqual(routing["role_mode"], "inherited")
+        self.assertIsNone(routing["role_model"])
+        report = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertEqual(report["status"], "BLOCKED")
+        # The blocker names the mode instead of pretending the role has a value.
+        blocker = next(gap for gap in report["external_gaps"] if "tdd_red" in gap)
+        self.assertIn("mode=inherited", blocker)
+        self.assertIn("не определена до запуска", blocker)
+
+    def test_an_unresolvable_role_model_never_waives_the_contract(self):
+        self.apply_init()
+        self.choose_executors(agent="claude-code", model=None, effort=None)
+        _, workflow, _ = devflow.load_project_state(self.repo)
+        node = next(item for item in workflow["nodes"] if item["id"] == "tdd_red")
+        for role_model in ({"mode": "inherited"}, {"mode": "unset"}):
+            config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+            config["roles"]["implementer"]["model"] = role_model
+            config["node_overrides"] = {
+                "tdd_red": {"model": {"mode": "explicit", "value": "writer-model"}},
+            }
+            routing = devflow.cross_model_routing(node, config)
+            self.assertIsNotNone(routing, role_model)
+            self.assertEqual(routing["role_mode"], role_model["mode"])
+        # An override that is itself not pinned is not routing: there is no second model.
+        config = devflow.load_json(self.repo / devflow.CONFIG_PATH)
+        config["node_overrides"] = {"tdd_red": {"model": {"mode": "inherited"}}}
+        self.assertIsNone(devflow.cross_model_routing(node, config))
+
+    def test_routing_to_another_model_requires_the_spec_and_checks_it_when_local(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(agent="claude-code")
+        self.route_tdd_red_to_another_model()
+        blocked = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertEqual(blocked["status"], "BLOCKED")
+        self.assertEqual(blocked["test_spec"]["required_because"], "cross-model-routing")
+        self.assertTrue(any("тот же ли это контекст" in gap
+                            for gap in blocked["external_gaps"]))
+        # A local reference is checked for free, so a broken spec cannot hide behind it.
+        (self.repo / "docs").mkdir(exist_ok=True)
+        (self.repo / "docs" / "spec.md").write_text(
+            self.SPEC.replace("- Expected failure reason: no validation exists yet", ""),
+            encoding="utf-8")
+        self.record_design_spec("docs/spec.md")
+        broken = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertEqual(broken["status"], "BLOCKED")
+        self.assertTrue(broken["test_spec"]["spec"]["local"])
+        self.assertTrue(any("не проходит проверку структуры" in gap
+                            for gap in broken["external_gaps"]))
+        (self.repo / "docs" / "spec.md").write_text(self.SPEC, encoding="utf-8")
+        passing = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertEqual(passing["test_spec"]["spec"]["status"], "PASS")
+        self.assertEqual(passing["status"], "PASS")
+
+    def test_a_non_local_spec_reference_is_stated_in_words_not_blocked(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(agent="claude-code")
+        self.route_tdd_red_to_another_model()
+        self.record_design_spec("https://example.invalid/spec")
+        report = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertFalse(report["test_spec"]["spec"]["local"])
+        self.assertIn("локально не проверяется", report["test_spec"]["spec"]["note"])
+        self.assertEqual(report["status"], "PASS")
+
+    def test_matching_models_need_no_spec_contract(self):
+        self.apply_init()
+        self.prepare_verified_delivery_state(agent="claude-code")
+        report = devflow.operate_preflight(self.repo, "tdd_red", "#6")
+        self.assertIsNone(report["test_spec"])
+        self.assertEqual(report["status"], "PASS")
+
+    def test_tdd_red_declares_the_spec_and_refuses_improvisation(self):
+        kit = devflow.find_project_kit(self.repo)
+        node = next(item for item in devflow.load_json(kit / "workflow.json")["nodes"]
+                    if item["id"] == "tdd_red")
+        self.assertIn("test spec", node["inputs"])
+        self.assertTrue(any("never improvised" in check for check in node["checks"]))
+        self.assertTrue(any("expected failure reason" in check for check in node["checks"]))
+        self.assertIn("test fails for intended reason", node["checks"])
+
+    def test_the_kit_names_no_model_anywhere(self):
+        kit = devflow.find_project_kit(self.repo)
+        for path in sorted(kit.rglob("*.json")) + sorted(kit.rglob("*.md")):
+            text = path.read_text(encoding="utf-8").lower()
+            for token in ("gpt-", "claude-opus", "claude-sonnet", "haiku", "o3-", "gemini"):
+                self.assertNotIn(token, text, f"{path.name} names a concrete model")
+
     # --- scale profiles ---------------------------------------------------------------
 
     def test_kit_chooses_no_scale_and_context_asks_with_the_command(self):
