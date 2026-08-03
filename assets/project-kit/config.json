@@ -5,6 +5,9 @@
     "name": "__AUTO__",
     "mode": "unconfigured",
     "product_stage": "unassessed",
+    "scale": {
+      "mode": "undecided"
+    },
     "decision_ref": "",
     "repository_type": "auto"
   },

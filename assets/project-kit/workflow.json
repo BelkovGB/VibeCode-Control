@@ -178,7 +178,12 @@
       "evidence_contract": {
         "review verdict bound to head SHA": {"kind": "review", "required": true}
       },
-      "checks": ["scope matches issue", "architecture docs current", "no unsupported claims"],
+      "checks": [
+        "scope matches issue",
+        "architecture docs current",
+        "no unsupported claims",
+        "solution matches the declared project scale and its complexity budget"
+      ],
       "timeout_minutes": 90
     },
     {

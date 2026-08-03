@@ -82,6 +82,8 @@ For every node, resolve and display:
 
 For every edge, require a named condition, bounded retries, and an explicit failure destination. Validate reachability, terminal paths, unknown roles, unsafe conditions, stale merge evidence, and unbounded cycles.
 
+Design happens against a declared scale. `project.scale` names a profile whose complexity budget the CLI prints — in `operate` and in the rendered session assignment — and never measures, and whose gate defaults it does compare, reporting each weaker setting with the command that would fix it. Choosing or changing the profile takes `devflow scale set <profile> --decision-ref <ref>`; a profile change under the recorded reference is refused as a silent rescale. Do not claim the tool verified a complexity budget: it verified the gate defaults.
+
 The architect works out the solution on the `design` node between the scope gate and Issue preparation, and produces a proposal — design decision, test spec, Issue draft — never a product decision. A choice the approved scope does not cover routes to `human_needed`, not back into the scope gate. Issue preparation then packages that output instead of designing again.
 
 Read [configuration-and-graph.md](references/configuration-and-graph.md) before changing the graph, schemas, roles, models, effort, permissions, or source precedence.
